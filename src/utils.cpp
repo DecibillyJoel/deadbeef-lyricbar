@@ -27,7 +27,7 @@ using namespace std;
 
 mutex mtx;
 
-int death_signal = 0;
+volatile int death_signal = 0;
 bool lyricstart = false;
 bool syncedlyrics = false;
 
