@@ -74,9 +74,11 @@ vector<int> sizelines(DB_playItem_t * track, string lyrics) {
 }
 
 void set_lyrics(DB_playItem_t *track, string past, string present, string future, string padding) {
+	deadbeef->pl_item_ref(track);
 	signal_idle().connect_once([track, past, present, future, padding ] {
 
 		if (!is_playing(track)) {
+			deadbeef->pl_item_unref(track);
 			return;
 		}
 		string artist, title;
@@ -103,8 +105,7 @@ void set_lyrics(DB_playItem_t *track, string past, string present, string future
 			refBuffer->insert_with_tags(refBuffer->end(),error, tagsSyncline);
 		}
 
-
-
+		deadbeef->pl_item_unref(track);
 
 	});
 }
@@ -278,21 +279,42 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 			debug_out << "DEADBEEF CLOSED \n";
 			death_signal = 1;
 			break;
+		case DB_EV_SONGCHANGED:
+		case DB_EV_SONGFINISHED:
+		{
+			debug_out << "SONG FINISHED/CHANGED\n";
+			death_signal = 1;
+			DB_playItem_t *pl_track = deadbeef->streamer_get_playing_track_safe();
+			if (!pl_track) {
+				// No track is playing; clear the lyrics display
+				last = NULL;
+				signal_idle().connect_once([] {
+					refBuffer->erase(refBuffer->begin(), refBuffer->end());
+				});
+			} else {
+				deadbeef->pl_item_unref(pl_track);
+			}
+			break;
+		}
 //		case DB_EV_TRACKINFOCHANGED:
 //			debug_out << "TRACKINFOCHANGED" << "\n";
 //			break;
 		case DB_EV_PLUGINSLOADED:
 		case DB_EV_SONGSTARTED:
+		{
 			debug_out << "SONG STARTED\n";
+			death_signal = 1;
 			if (!event->track || event->track == last || deadbeef->pl_get_item_duration(event->track) <= 0.0){
 //				std::cout << "if in" << "\n";
 				return 0;
 			}
 			last = event->track;
+			deadbeef->pl_item_ref(event->track);
 //			std::cout << "SONG STARTED" << "\n";
 			auto tid = deadbeef->thread_start(update_lyrics, event->track);
 			deadbeef->thread_detach(tid);
 			break;
+		}
 	}
 
 	return 0;

@@ -213,14 +213,11 @@ void write_synced( DB_playItem_t *it){
 // Main loop to update lyrics on real time.
 void thread_listener(DB_playItem_t *track){
 
-	if ((is_playing(track)) && death_signal == 0){
+	while ((is_playing(track)) && death_signal == 0){
 		nanosleep(&ts, NULL);
 		write_synced(track);
-		thread_listener(track);
 	}
-	else{
-		pthread_exit (NULL);
-	}
+	deadbeef->pl_item_unref(track);
 }
 
 // Main loop thread caller.
@@ -228,6 +225,9 @@ void chopset_lyrics(DB_playItem_t *track, string lyrics){
 //	cout << "Chopset lyrics" "\n";
 	lrc = lyric2vector(lyrics);
 	DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
+	if (!it) {
+		return;
+	}
 	float length = deadbeef->pl_get_item_duration(it);
 
 	lrc.position.push_back((float)length -0.2);
@@ -242,10 +242,10 @@ void chopset_lyrics(DB_playItem_t *track, string lyrics){
 		linessizes = sizelines(track, prelyrics);
 	}
 
+	// thread_listener will unref `it` when it finishes
 	mtx.lock();
 	thread t1(thread_listener, it);
 	t1.detach();
-	deadbeef->pl_item_unref(it);
 	mtx.unlock();
 }
 
@@ -689,7 +689,8 @@ void update_lyrics(void *tr) {
 			set_lyrics(track, "", "", meta_lyrics.lyrics, "");
 		}
 		sync_or_unsync(meta_lyrics.sync);
-	return;
+		deadbeef->pl_item_unref(track);
+		return;
 	}
 
 	const char *artist;
@@ -714,6 +715,7 @@ void update_lyrics(void *tr) {
 				set_lyrics(track, "", "", cached_lyrics.lyrics, "");
 			}
 			sync_or_unsync(cached_lyrics.sync);
+			deadbeef->pl_item_unref(track);
 			return;
 		}
 	}
@@ -741,11 +743,13 @@ void update_lyrics(void *tr) {
 	    	    save_next_to_file(track, lrclib_lyrics);
 	    	}
 	    	
+	    	deadbeef->pl_item_unref(track);
 	    	return;
     	}
     }
 //	If no lyrics founded in any site, show track info:
 	set_info(track);
+	deadbeef->pl_item_unref(track);
 }
 
 //---------------------------------------------------------------------
