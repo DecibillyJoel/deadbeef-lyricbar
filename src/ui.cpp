@@ -8,6 +8,10 @@
 #include <gtkmm.h>
 #include <time.h>
 #include <string>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <memory>
 
 using namespace std;
 using namespace Gtk;
@@ -30,6 +34,7 @@ static ScrolledWindow *lyricbar;
 static RefPtr<TextBuffer> refBuffer;
 static RefPtr<TextTag> tagItalic, tagBold, tagLarge, tagCenter, tagSmall, tagForegroundColorHighlight,tagForegroundColorRegular, tagLeftmargin, tagRightmargin, tagRegular;
 static vector<RefPtr<TextTag>> tagsTitle, tagsArtist, tagsSyncline, tagsNosyncline, tagPadding;
+static volatile bool lyricbar_active = false;
 
 bool isValidHexaCode(string str) {
     regex hexaCode("^#([a-fA-F0-9]{6}|[a-fA-F0-9]{3})$");
@@ -41,42 +46,80 @@ vector<int> sizelines(DB_playItem_t * track, string lyrics) {
 	set_lyrics(track, lyrics,"","","");
 //	std::cout << "Sizelines" << "\n";
 	death_signal = 1;
-	int sumatory = 0;
-	int temporaly = 0;
-	vector<int>  values;
 
 //	I didn't found another way to be sure lyrics are displayed than wait millisenconds with nanosleep.
 	nanosleep(&tss, NULL);
-	deadbeef->pl_lock();
-	values.push_back(lyricbar->get_allocation().get_height()*(deadbeef->conf_get_int("lyricbar.vpostion", 50))/100);
-	deadbeef->pl_unlock();
-	values.push_back(0);
-	Gdk::Rectangle rectangle;
-	for (int i = 2; i < refBuffer->get_line_count()-1; i++) {
-		lyricView->get_iter_location(refBuffer->get_iter_at_line(i-2), rectangle);
-		values.push_back(rectangle.get_y() - temporaly);
-		temporaly = rectangle.get_y();
-	}
 
-	values[1] = values.size()-3;
+	// Use shared_ptr so the result survives even if we time out
+	struct SizelineResult {
+		std::mutex mtx;
+		std::condition_variable cv;
+		bool done = false;
+		vector<int> values;
+	};
+	auto result = std::make_shared<SizelineResult>();
 
-	for (unsigned i = 2; i < values.size()-2; i++) {
-		sumatory += values[i];
-		if (sumatory > (values[0] - values[3] - values[4])) {
-			values[1] = i-2;
-			break;
+	signal_idle().connect_once([result] {
+		if (!lyricbar_active || !refBuffer || !lyricView || !lyricbar) {
+			std::lock_guard<std::mutex> lk(result->mtx);
+			result->done = true;
+			result->cv.notify_one();
+			return;
 		}
+
+		int temporaly = 0;
+		int sumatory = 0;
+
+		deadbeef->pl_lock();
+		result->values.push_back(lyricbar->get_allocation().get_height()*(deadbeef->conf_get_int("lyricbar.vpostion", 50))/100);
+		deadbeef->pl_unlock();
+		result->values.push_back(0);
+		Gdk::Rectangle rectangle;
+		for (int i = 2; i < refBuffer->get_line_count()-1; i++) {
+			lyricView->get_iter_location(refBuffer->get_iter_at_line(i-2), rectangle);
+			result->values.push_back(rectangle.get_y() - temporaly);
+			temporaly = rectangle.get_y();
+		}
+
+		// Need at least 5 values: [0]=viewport height, [1]=line count,
+		// [2..N-1]=line heights. Minimum 3 line heights needed for the
+		// padding calculation below (values[3] and values[4]).
+		if (result->values.size() >= 5) {
+			result->values[1] = result->values.size()-3;
+
+			for (unsigned i = 2; i < result->values.size()-2; i++) {
+				sumatory += result->values[i];
+				if (sumatory > (result->values[0] - result->values[3] - result->values[4])) {
+					result->values[1] = i-2;
+					break;
+				}
+			}
+		}
+
+		std::lock_guard<std::mutex> lk(result->mtx);
+		result->done = true;
+		result->cv.notify_one();
+	});
+
+	{
+		std::unique_lock<std::mutex> lk(result->mtx);
+		// Wait up to 2 seconds for the main thread to complete the measurement.
+		// This is generous; the idle callback typically fires within milliseconds.
+		result->cv.wait_for(lk, std::chrono::seconds(2), [&result]{ return result->done; });
 	}
+
 //	std::cout << "Sizelines finished" << "\n";
 	death_signal = 0;
 
-	return values;
+	return result->values;
 }
 
 void set_lyrics(DB_playItem_t *track, string past, string present, string future, string padding) {
+	deadbeef->pl_item_ref(track);
 	signal_idle().connect_once([track, past, present, future, padding ] {
 
-		if (!is_playing(track)) {
+		if (!lyricbar_active || !refBuffer || !is_playing(track)) {
+			deadbeef->pl_item_unref(track);
 			return;
 		}
 		string artist, title;
@@ -103,20 +146,22 @@ void set_lyrics(DB_playItem_t *track, string past, string present, string future
 			refBuffer->insert_with_tags(refBuffer->end(),error, tagsSyncline);
 		}
 
-
-
+		deadbeef->pl_item_unref(track);
 
 	});
 }
 
 // To have scroll bars or not when lyrics are synced or not.
 void sync_or_unsync(bool syncedlyrics) {
-	if (syncedlyrics == true) {
-		lyricbar->set_policy(POLICY_EXTERNAL, POLICY_EXTERNAL);
-	}
-	else{
-		lyricbar->set_policy(POLICY_AUTOMATIC, POLICY_AUTOMATIC);
-	}
+	signal_idle().connect_once([syncedlyrics] {
+		if (!lyricbar_active || !lyricbar) return;
+		if (syncedlyrics == true) {
+			lyricbar->set_policy(POLICY_EXTERNAL, POLICY_EXTERNAL);
+		}
+		else{
+			lyricbar->set_policy(POLICY_AUTOMATIC, POLICY_AUTOMATIC);
+		}
+	});
 }
 
 Justification get_justification() {
@@ -249,6 +294,7 @@ GtkWidget *construct_lyricbar() {
 
 	RefPtr<Gtk::CssProvider> cssProvider = Gtk::CssProvider::create();
 	cssProvider->load_from_data(data);
+	g_free(data);
 	
 	RefPtr<Gtk::StyleContext> styleContext = Gtk::StyleContext::create();
 	
@@ -258,7 +304,7 @@ GtkWidget *construct_lyricbar() {
 	//add provider for screen in all application
 	styleContext->add_provider_for_screen(screen, cssProvider, GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-
+	lyricbar_active = true;
 	return GTK_WIDGET(lyricbar->gobj());
 }
 
@@ -271,28 +317,61 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 	switch (id) {
 		case DB_EV_CONFIGCHANGED:
 			debug_out << "CONFIG CHANGED\n";
-			get_tags();
-			signal_idle().connect_once([]{ lyricView->set_justification(get_justification()); });
+			signal_idle().connect_once([]{
+				if (lyricbar_active && refBuffer) {
+					get_tags();
+				}
+				if (lyricbar_active && lyricView) {
+					lyricView->set_justification(get_justification());
+				}
+			});
 			break;
 		case DB_EV_TERMINATE:
 			debug_out << "DEADBEEF CLOSED \n";
 			death_signal = 1;
 			break;
+		case DB_EV_SONGCHANGED:
+		case DB_EV_SONGFINISHED:
+		{
+			debug_out << "SONG FINISHED/CHANGED\n";
+			death_signal = 1;
+			DB_playItem_t *pl_track = deadbeef->streamer_get_playing_track_safe();
+			if (!pl_track) {
+				// No track is playing; clear the lyrics display
+				last = NULL;
+				signal_idle().connect_once([] {
+					if (lyricbar_active && refBuffer) {
+						refBuffer->erase(refBuffer->begin(), refBuffer->end());
+					}
+				});
+			} else {
+				deadbeef->pl_item_unref(pl_track);
+			}
+			break;
+		}
 //		case DB_EV_TRACKINFOCHANGED:
 //			debug_out << "TRACKINFOCHANGED" << "\n";
 //			break;
 		case DB_EV_PLUGINSLOADED:
 		case DB_EV_SONGSTARTED:
+		{
 			debug_out << "SONG STARTED\n";
+			death_signal = 1;
 			if (!event->track || event->track == last || deadbeef->pl_get_item_duration(event->track) <= 0.0){
 //				std::cout << "if in" << "\n";
 				return 0;
 			}
 			last = event->track;
+			deadbeef->pl_item_ref(event->track);
 //			std::cout << "SONG STARTED" << "\n";
 			auto tid = deadbeef->thread_start(update_lyrics, event->track);
+			if (!tid) {
+				deadbeef->pl_item_unref(event->track);
+				break;
+			}
 			deadbeef->thread_detach(tid);
 			break;
+		}
 	}
 
 	return 0;
@@ -300,8 +379,12 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 
 extern "C"
 void lyricbar_destroy() {
+	lyricbar_active = false;
+	death_signal = 1;
 	delete lyricbar;
+	lyricbar = nullptr;
 	delete lyricView;
+	lyricView = nullptr;
 	tagsArtist.clear();
 	tagPadding.clear();
 	tagsSyncline.clear();
