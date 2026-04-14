@@ -81,6 +81,9 @@ vector<int> sizelines(DB_playItem_t * track, string lyrics) {
 			temporaly = rectangle.get_y();
 		}
 
+		// Need at least 5 values: [0]=viewport height, [1]=line count,
+		// [2..N-1]=line heights. Minimum 3 line heights needed for the
+		// padding calculation below (values[3] and values[4]).
 		if (result->values.size() >= 5) {
 			result->values[1] = result->values.size()-3;
 
@@ -100,6 +103,8 @@ vector<int> sizelines(DB_playItem_t * track, string lyrics) {
 
 	{
 		std::unique_lock<std::mutex> lk(result->mtx);
+		// Wait up to 2 seconds for the main thread to complete the measurement.
+		// This is generous; the idle callback typically fires within milliseconds.
 		result->cv.wait_for(lk, std::chrono::seconds(2), [&result]{ return result->done; });
 	}
 
