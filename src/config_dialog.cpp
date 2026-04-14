@@ -393,37 +393,47 @@ string specialtoplus(string text) {;
     return result;
 }
 
-void populate_tree_view(vector<string> songs, string source) {
-	for(size_t i = 0; i < songs.size(); i+=4) {
-		gtk_tree_store_append (treeStore, &iter_populate, NULL);
-		gtk_tree_store_set(treeStore, &iter_populate, 0, songs[i].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 1, songs[i+1].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 2, songs[i+2].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 3, source.c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 4, songs[i+3].c_str(), -1);
+struct populate_data {
+	vector<string> songs;
+	string source;
+};
+
+static gboolean populate_tree_view_idle(gpointer user_data) {
+	populate_data *data = static_cast<populate_data *>(user_data);
+	if (treeStore) {
+		for(size_t i = 0; i + 3 < data->songs.size(); i+=4) {
+			gtk_tree_store_append (treeStore, &iter_populate, NULL);
+			gtk_tree_store_set(treeStore, &iter_populate, 0, data->songs[i].c_str(), -1);
+			gtk_tree_store_set(treeStore, &iter_populate, 1, data->songs[i+1].c_str(), -1);
+			gtk_tree_store_set(treeStore, &iter_populate, 2, data->songs[i+2].c_str(), -1);
+			gtk_tree_store_set(treeStore, &iter_populate, 3, data->source.c_str(), -1);
+			gtk_tree_store_set(treeStore, &iter_populate, 4, data->songs[i+3].c_str(), -1);
+		}
 	}
-	
+	delete data;
+	return G_SOURCE_REMOVE;
+}
+
+void populate_tree_view(vector<string> songs, string source) {
+	// Schedule GTK updates on the main thread to avoid thread-safety crashes
+	populate_data *data = new populate_data{std::move(songs), std::move(source)};
+	g_idle_add(populate_tree_view_idle, data);
 }
 
 void on_Save_clicked (GtkButton *b, gpointer user_data) {
-	deadbeef->pl_lock();
-	DB_playItem_t *track = static_cast<DB_playItem_t *>(user_data);
-	deadbeef->pl_unlock(); 
+	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
 	if (track){
-		save_meta_data( track, selected_lyrics);
-		DB_playItem_t *playing_track = deadbeef->streamer_get_playing_track_safe();
-		if (playing_track){
-			if (playing_track == track){
-				death_signal = 1;
-				auto tid = deadbeef->thread_start(update_lyrics, track);
-				deadbeef->thread_detach(tid);
-			}
-			else{
-				deadbeef->pl_item_unref(playing_track);
-			}
+		save_meta_data(track, selected_lyrics);
+		death_signal = 1;
+		// update_lyrics expects a ref'd track and will unref it when done
+		deadbeef->pl_item_ref(track);
+		auto tid = deadbeef->thread_start(update_lyrics, track);
+		if (!tid) {
+			deadbeef->pl_item_unref(track);
+		} else {
+			deadbeef->thread_detach(tid);
 		}
 		deadbeef->pl_item_unref(track);
-		//gtk_label_set_text (GTK_LABEL(Title), (const gchar* ) "OK");
 	}
 }
 
@@ -460,6 +470,8 @@ void	on_row_double_clicked (GtkButton *b) {
 //	}
 
 	gtk_label_set_label(PreViewLyrics,selected_lyrics.lyrics.c_str());
+	g_free(provider);
+	g_free(value);
 }
 
 void thread_listener_Megalobiz(string text_song, string text_artist){
@@ -468,12 +480,12 @@ void thread_listener_Megalobiz(string text_song, string text_artist){
 }
 
 void thread_listener_LrcLib(string text_song, string text_artist, string text_album){	
-	deadbeef->pl_lock();
+	int int_duration = 0;
 	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
-	float length = deadbeef->pl_get_item_duration(track);
-	deadbeef->pl_item_unref(track);
-	deadbeef->pl_unlock();
-	int int_duration = static_cast<int>(length);
+	if (track) {
+		int_duration = static_cast<int>(deadbeef->pl_get_item_duration(track));
+		deadbeef->pl_item_unref(track);
+	}
 	vector<string> lrclib_songs = lrclib_get_songs(text_song, text_artist, text_album, int_duration);
 	populate_tree_view(lrclib_songs, "LRCLIB");
 }
@@ -582,10 +594,12 @@ int on_button_search (GtkMenuItem *menuitem, gpointer user_data) {
 		if (plt) {
 			int cursor = deadbeef->pl_get_cursor (PL_MAIN);
             track = deadbeef->pl_get_for_idx_and_iter (cursor, PL_MAIN);
-			gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist"));
-			gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title"));
-			gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album"));	
-			deadbeef->pl_item_unref(track);
+            if (track) {
+				gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist"));
+				gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title"));
+				gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album"));	
+				deadbeef->pl_item_unref(track);
+			}
 			deadbeef->plt_unref(plt);
 			}
 	}
@@ -604,7 +618,7 @@ int on_button_search (GtkMenuItem *menuitem, gpointer user_data) {
 	g_signal_connect(SearchWindow, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 	gtk_builder_connect_signals(builder, NULL);
 	g_signal_connect(SongsTree, "row-activated", G_CALLBACK(on_row_double_clicked), selection);
-	g_signal_connect(Save, "clicked", G_CALLBACK(on_Save_clicked), track);
+	g_signal_connect(Save, "clicked", G_CALLBACK(on_Save_clicked), NULL);
 	g_signal_connect(Exit, "clicked", G_CALLBACK(on_Exit_clicked), SearchWindow);
 	g_signal_connect(Search, "clicked", G_CALLBACK(on_Search_clicked), NULL);
 
