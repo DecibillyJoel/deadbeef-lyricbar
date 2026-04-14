@@ -213,11 +213,13 @@ void write_synced( DB_playItem_t *it){
 // Main loop to update lyrics on real time.
 void thread_listener(DB_playItem_t *track){
 
-	while ((is_playing(track)) && death_signal == 0){
+	while (track && (is_playing(track)) && death_signal == 0){
 		nanosleep(&ts, NULL);
 		write_synced(track);
 	}
-	deadbeef->pl_item_unref(track);
+	if (track) {
+		deadbeef->pl_item_unref(track);
+	}
 }
 
 // Main loop thread caller.

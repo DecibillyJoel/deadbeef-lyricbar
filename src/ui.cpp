@@ -312,6 +312,10 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 			deadbeef->pl_item_ref(event->track);
 //			std::cout << "SONG STARTED" << "\n";
 			auto tid = deadbeef->thread_start(update_lyrics, event->track);
+			if (!tid) {
+				deadbeef->pl_item_unref(event->track);
+				break;
+			}
 			deadbeef->thread_detach(tid);
 			break;
 		}
