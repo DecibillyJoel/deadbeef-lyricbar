@@ -294,6 +294,7 @@ GtkWidget *construct_lyricbar() {
 
 	RefPtr<Gtk::CssProvider> cssProvider = Gtk::CssProvider::create();
 	cssProvider->load_from_data(data);
+	g_free(data);
 	
 	RefPtr<Gtk::StyleContext> styleContext = Gtk::StyleContext::create();
 	
@@ -316,10 +317,10 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 	switch (id) {
 		case DB_EV_CONFIGCHANGED:
 			debug_out << "CONFIG CHANGED\n";
-			if (lyricbar_active && refBuffer) {
-				get_tags();
-			}
 			signal_idle().connect_once([]{
+				if (lyricbar_active && refBuffer) {
+					get_tags();
+				}
 				if (lyricbar_active && lyricView) {
 					lyricView->set_justification(get_justification());
 				}

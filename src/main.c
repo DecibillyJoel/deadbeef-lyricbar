@@ -27,11 +27,12 @@ static gboolean _pop (GtkTextView *text_view, GtkWidget *popup, gpointer user_da
 	popup_edit = gtk_menu_item_new_with_label(_("Edit"));
 
 	GList *children = gtk_container_get_children(GTK_CONTAINER(popup));
-	gtk_container_remove(GTK_CONTAINER(popup),children->data);
-	while ((children = g_list_next(children)) != NULL) {
-//		printf("%s \n",gtk_menu_item_get_label(children->data));
+	GList *head = children;
+	while (children != NULL) {
 		gtk_container_remove(GTK_CONTAINER(popup),children->data);
+		children = g_list_next(children);
 	}
+	g_list_free(head);
 	gtk_menu_attach(GTK_MENU(popup),popup_config,0,1,0,1);
 	gtk_menu_attach(GTK_MENU(popup),popup_search,0,1,1,2);
 	gtk_menu_attach(GTK_MENU(popup),popup_edit,0,1,2,3);
@@ -39,7 +40,6 @@ static gboolean _pop (GtkTextView *text_view, GtkWidget *popup, gpointer user_da
 	gtk_widget_show(popup_config);
 	gtk_widget_show(popup_search);
 	gtk_widget_show(popup_edit);
-	deadbeef->pl_lock();
 	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
 	if (track) {
 		deadbeef->pl_item_unref(track);
@@ -48,7 +48,6 @@ static gboolean _pop (GtkTextView *text_view, GtkWidget *popup, gpointer user_da
 		gtk_widget_set_sensitive (popup_edit,FALSE);
 		gtk_widget_set_sensitive (popup_search,FALSE);
 	}
-	deadbeef->pl_unlock();
 	
 	g_signal_connect_after(popup_config, "activate", G_CALLBACK(on_button_config), user_data);
 	g_signal_connect_after(popup_search, "activate", G_CALLBACK(on_button_search), user_data);

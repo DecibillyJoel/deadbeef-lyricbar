@@ -7,6 +7,7 @@
 #include "gettext.h"
 
 #include <sys/stat.h>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -314,7 +315,8 @@ void save_meta_data(DB_playItem_t *playing_song, struct parsed_lyrics lyrics){
 	char decoder_id[100];
 
 	if (dec){
-		strncpy(decoder_id, dec, sizeof(decoder_id));
+		strncpy(decoder_id, dec, sizeof(decoder_id) - 1);
+		decoder_id[sizeof(decoder_id) - 1] = '\0';
 	}
 	int match = playing_song && dec;
 	deadbeef->pl_unlock();
@@ -611,11 +613,14 @@ void set_info(DB_playItem_t *track) {
 
 	if (!firs_str.empty()) {
 		info.append(_("For the first time "));
-		info.append(firs_str.substr(0,10));
+		info.append(firs_str.substr(0, std::min((size_t)10, firs_str.length())));
 		info.append("\n");
-		info.append(_("at "));
-		info.append(firs_str.substr(11, firs_str.length() -1));
-		info.append("\n \n");
+		if (firs_str.length() > 11) {
+			info.append(_("at "));
+			info.append(firs_str.substr(11));
+			info.append("\n");
+		}
+		info.append(" \n");
 	}
 	else{
 		info.append(_("Never listened before"));
@@ -624,11 +629,14 @@ void set_info(DB_playItem_t *track) {
 
 	if (!las_str.empty()) {
 		info.append(_("For the last time the "));
-		info.append(las_str.substr(0,10));
+		info.append(las_str.substr(0, std::min((size_t)10, las_str.length())));
 		info.append("\n");
-		info.append(_("at "));
-		info.append( las_str.substr(11, las_str.length() -1));
-		info.append("\n \n");
+		if (las_str.length() > 11) {
+			info.append(_("at "));
+			info.append(las_str.substr(11));
+			info.append("\n");
+		}
+		info.append(" \n");
 	}
 
 
