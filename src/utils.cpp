@@ -111,13 +111,13 @@ struct sync lyric2vector( string lyrics){
 	int squarebracket;
 	int repeats = 0; 
 	//If last character is a ] add an space to have same number of lyrics and positions.
-	if (lyrics.at(lyrics.length() - 1) == ']'){
-		lyrics.push_back(' ');
-	}
-	if (lyrics.length() <= 3){
+	if (lyrics.empty() || lyrics.length() <= 3){
 		position.push_back(0);
 		struct sync  emptylyrics = bubbleSort(position, synclyrics, 1);
 		return emptylyrics;
+	}
+	if (lyrics.at(lyrics.length() - 1) == ']'){
+		lyrics.push_back(' ');
 	}
 
 	for (unsigned i=0; i < lyrics.length() - 3; ++i){
@@ -188,7 +188,8 @@ void write_synced( DB_playItem_t *it){
 		}
 
 		//Add padding variable at beginning of lyrics to show to make scroll with first lines.
-		if (!local_linessizes.empty()){
+		if (local_linessizes.size() >= 2 &&
+			(local_linessizes[1]+1) < (int)local_lrc.position.size()){
 			for  (int j = 0; j < (int)((local_lrc.position[local_linessizes[1]+1] - pos)/(local_lrc.position[local_linessizes[1]+1])*local_linessizes[0]); j++){
 				padding.append("\n");
 			}
@@ -197,15 +198,18 @@ void write_synced( DB_playItem_t *it){
 //cout << "Present position: " << presentpos << " pos: " << pos << "\n";
 
 		//Add padding variable at beginning of lyrics to show to make scroll when removing a past line.
-		if (((!local_linessizes.empty()) && (presentpos - local_linessizes[1]) > 0)){
+		int ls_idx = presentpos - (local_linessizes.size() >= 2 ? local_linessizes[1] : 0) + 5;
+		if (local_linessizes.size() >= 2 && (presentpos - local_linessizes[1]) > 0 &&
+			ls_idx >= 0 && ls_idx < (int)local_linessizes.size() &&
+			(presentpos + 1) < (int)local_lrc.position.size()){
 			minimuntopad = presentpos - local_linessizes[1];
-			for  (int j = 0 ; j < (int)(((local_lrc.position[presentpos +1] - pos)/(local_lrc.position[presentpos+1] -local_lrc.position[presentpos]))*(local_linessizes[presentpos - local_linessizes[1] + 5] -1)); j++){
+			for  (int j = 0 ; j < (int)(((local_lrc.position[presentpos +1] - pos)/(local_lrc.position[presentpos+1] -local_lrc.position[presentpos]))*(local_linessizes[ls_idx] -1)); j++){
 				padding.append("\n");
 			}
 		}
 
 		//Removing first past lyrics lines to make scroll.
-		for (unsigned i = minimuntopad; local_lrc.position[i+1] < pos && i < local_lrc.position.size()-2; i++){
+		for (unsigned i = minimuntopad; i < local_lrc.position.size()-2 && local_lrc.position[i+1] < pos; i++){
 			past.append(local_lrc.synclyrics[i] + "\n");
 		}
 	set_lyrics(it, past, present, future, padding);
@@ -454,8 +458,8 @@ struct parsed_lyrics get_lyrics_next_to_file(DB_playItem_t *track) {
 
 	deadbeef->pl_lock();
 	const char *track_location = deadbeef->pl_find_meta(track, ":URI");
+	string trackstring = track_location ? track_location : "";
 	deadbeef->pl_unlock();
-	string trackstring = track_location;
 	size_t lastindex = trackstring.find_last_of(".");
 	trackstring = trackstring.substr(0, lastindex);
 	infile.open(trackstring + ".lrc", ios_base::out);
@@ -509,9 +513,9 @@ struct parsed_lyrics get_lyrics_from_metadata(DB_playItem_t *track) {
 void save_next_to_file(DB_playItem_t *track, struct parsed_lyrics lyrics) {
 	deadbeef->pl_lock();
 	const char *track_location = deadbeef->pl_find_meta(track, ":URI");
+	string trackstring = track_location ? track_location : "";
 	deadbeef->pl_unlock();
 	ofstream outfile;
-	string trackstring = track_location;
 	size_t lastindex = trackstring.find_last_of(".");
 	trackstring = trackstring.substr(0, lastindex);
 	
@@ -716,18 +720,20 @@ void update_lyrics(void *tr) {
 		return;
 	}
 
-	const char *artist;
-	const char *title;
+	string artist_str;
+	string title_str;
 	{
 		deadbeef->pl_lock();
-		artist = deadbeef->pl_find_meta(track, "artist") ?: _("Unknown Artist");
-		title  = deadbeef->pl_find_meta(track, "title") ?: _("Unknown Title");
+		const char *a = deadbeef->pl_find_meta(track, "artist");
+		const char *t = deadbeef->pl_find_meta(track, "title");
+		artist_str = a ? a : _("Unknown Artist");
+		title_str  = t ? t : _("Unknown Title");
 		deadbeef->pl_unlock();
 	}
 
 
 
-	if (artist && title) {
+	if (!artist_str.empty() && !title_str.empty()) {
 		struct parsed_lyrics cached_lyrics = get_lyrics_next_to_file(track);
 
 		if (cached_lyrics.lyrics != "") {
@@ -748,7 +754,7 @@ void update_lyrics(void *tr) {
 //	Search for lyrics on LRCLIB:
     if (deadbeef->conf_get_float("lyricbar.fontscale", 1) == 1){
     	struct parsed_lyrics lrclib_lyrics = {"",false};
-    	lrclib_lyrics = lrclib(string(title), string(artist), "");
+    	lrclib_lyrics = lrclib(title_str, artist_str, "");
     	if (lrclib_lyrics.lyrics != "") {
     		if (lrclib_lyrics.sync){
     			chopset_lyrics(track, lrclib_lyrics.lyrics);
@@ -817,12 +823,12 @@ int remove_from_cache_action(DB_plugin_action_t *, ddb_action_context_t ctx) {
 					}
 				}
 				DB_playItem_t *next = deadbeef->pl_get_next(current, PL_MAIN);
-				deadbeef->pl_unlock();
 				deadbeef->pl_item_unref(current);
 				current = next;
 			}
 			deadbeef->plt_unref(playlist);
 		}
+		deadbeef->pl_unlock();
 	}
 	return 0;
 }
