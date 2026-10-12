@@ -8,6 +8,8 @@
 #include "sources/megalobiz.h"
 #include "sources/azlyrics.h"
 #include "sources/rclyricsband.h"
+#include "sources/paxsenix.h"
+#include "sources/musixmatch.h"
 #include <deadbeef/deadbeef.h>
 #include "resources.h"
 #include <gtkmm.h>
@@ -15,11 +17,64 @@
 #include <filesystem>
 #include <vector>
 #include <thread>
-#include <future>		
+#include <functional>
+#include <future>
+#include <atomic>
+#include <mutex>
 #include <iostream>
 #include <string>
 
 // - Global
+
+// Each dialog is non-modal and runs on the host's GTK loop (no nested gtk_main()).
+// Lifetime: owned by the window (destroy handler). Worker threads only touch it
+// through ref_win(), which keeps it alive until unref_win().
+struct WinCtx {
+	GtkWindow **slot;
+	GtkBuilder *builder;
+	guint timeout_id;
+	unsigned gen;
+	std::atomic<int> refs{1};
+	std::mutex m;
+	bool dead = false;
+};
+
+static WinCtx *ref_win(WinCtx *c) {
+	if (!c) return NULL;
+	std::lock_guard<std::mutex> lk(c->m);
+	if (c->dead) return NULL;
+	c->refs++;
+	return c;
+}
+
+static void unref_win(WinCtx *c) {
+	bool gone = false;
+	{
+		std::lock_guard<std::mutex> lk(c->m);
+		gone = --c->refs == 0 && c->dead;
+	}
+	if (gone) { g_object_unref(c->builder); delete c; }
+}
+
+static void on_win_destroy(GtkWidget *, gpointer p) {
+	WinCtx *c = static_cast<WinCtx *>(p);
+	if (c->timeout_id) g_source_remove(c->timeout_id);
+	if (c->slot) *c->slot = NULL;
+	bool gone = false;
+	{
+		std::lock_guard<std::mutex> lk(c->m);
+		c->dead = true;
+		gone = --c->refs == 0;
+	}
+	// The window outlives in-flight workers via their refs; free here only if none.
+	if (gone) { g_object_unref(c->builder); delete c; }
+}
+
+static WinCtx *track_window(GtkWindow *w, GtkWindow **slot, GtkBuilder *b) {
+	WinCtx *c = new WinCtx{slot, b, 0, 0};
+	g_signal_connect(w, "destroy", G_CALLBACK(on_win_destroy), c);
+	return c;
+}
 
 //char *locale_lang = setlocale(LC_CTYPE, NULL);
 locale l("");
@@ -27,7 +82,6 @@ locale l("");
 // - Config widgets
 
 GtkWindow		*ConfigWindow;
-GtkBuilder		*builder;
 GtkColorButton	*Background_color;
 GtkColorButton	*Highlight_color;
 GtkColorButton	*Text_color;
@@ -85,7 +139,6 @@ GtkLabel			*Album_label;
 struct parsed_lyrics selected_lyrics = {"",false};
 
 DB_playItem_t *it;
-GtkTreeIter iter_populate;
 
 // - Edit widgets
 
@@ -229,12 +282,16 @@ void set_chooser_color(GtkColorButton *chooser, const char *hexColor ){
 
 extern "C"
 int on_button_config (GtkMenuItem *menuitem, gpointer user_data) {
+	if (ConfigWindow) {
+		gtk_window_present(ConfigWindow);
+		return 0;
+	}
 
 //---------------------------------------------------------------------
 // establish contact with xml code used to adjust widget settings
 //---------------------------------------------------------------------
 
-	builder = gtk_builder_new_from_resource ("/src/panels.glade");
+	GtkBuilder *builder = gtk_builder_new_from_resource ("/src/panels.glade");
  
 	ConfigWindow = GTK_WINDOW(gtk_builder_get_object(builder, "ConfigWindow"));
 
@@ -288,7 +345,7 @@ int on_button_config (GtkMenuItem *menuitem, gpointer user_data) {
 	gtk_radio_button_join_group(Save_no_save, Save_IDTag);
 	
 //	Signals:
-	g_signal_connect(ConfigWindow, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+	track_window(ConfigWindow, &ConfigWindow, builder);
 	gtk_builder_connect_signals(builder, NULL);
 	g_signal_connect(Background_color, "color-set", G_CALLBACK(on_Background_color_color_set), NULL);
 	g_signal_connect(Highlight_color, "color-set", G_CALLBACK(on_Highlight_color_color_set), NULL);
@@ -352,9 +409,8 @@ int on_button_config (GtkMenuItem *menuitem, gpointer user_data) {
 	gtk_widget_grab_focus(GTK_WIDGET(ConfigWindow));
 	gtk_window_set_keep_above(ConfigWindow,1);
 
-	gtk_main();
 
-	return EXIT_SUCCESS;
+	return 0;
 }
 
 //---------------------------------------------------------------------
@@ -393,130 +449,146 @@ string specialtoplus(string text) {;
     return result;
 }
 
-void populate_tree_view(vector<string> songs, string source) {
-	for(size_t i = 0; i < songs.size(); i+=4) {
-		gtk_tree_store_append (treeStore, &iter_populate, NULL);
-		gtk_tree_store_set(treeStore, &iter_populate, 0, songs[i].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 1, songs[i+1].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 2, songs[i+2].c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 3, source.c_str(), -1);
-		gtk_tree_store_set(treeStore, &iter_populate, 4, songs[i+3].c_str(), -1);
+struct PopulateJob { GtkTreeStore *store; vector<string> songs; string source; unsigned gen; WinCtx *win; };
+
+static gboolean populate_idle(gpointer p) {
+	PopulateJob *j = static_cast<PopulateJob *>(p);
+	if (j->win) {
+		std::lock_guard<std::mutex> lk(j->win->m);
+		if (j->win->dead || !j->win->slot || !*j->win->slot || j->gen != j->win->gen) {
+			g_object_unref(j->store);
+			unref_win(j->win);
+			delete j;
+			return G_SOURCE_REMOVE;   // window closed or stale search
+		}
 	}
-	
+	GtkTreeIter it;
+	for (size_t i = 0; i + 3 < j->songs.size(); i += 4) {
+		gtk_tree_store_append(j->store, &it, NULL);
+		gtk_tree_store_set(j->store, &it,
+		                   0, j->songs[i].c_str(), 1, j->songs[i+1].c_str(), 2, j->songs[i+2].c_str(),
+		                   3, j->source.c_str(), 4, j->songs[i+3].c_str(), -1);
+	}
+	g_object_unref(j->store);
+	if (j->win) unref_win(j->win);
+	delete j;
+	return G_SOURCE_REMOVE;
 }
 
+// Safe from any thread. Consumes one reference on `store`; holds a WinCtx ref so a
+// closed window cannot be freed under us. Late results of an older search are dropped.
+void populate_tree_view(vector<string> songs, string source, GtkTreeStore *store, WinCtx *win) {
+	WinCtx *held = ref_win(win);
+	PopulateJob *j = new PopulateJob{store, std::move(songs), std::move(source), win ? win->gen : 0, held};
+	g_idle_add(populate_idle, j);
+}
+
+// `track` is the playing track captured when the search dialog was built (see
+// on_button_search); it is NOT reffed, so never unref it here. Second Save on a
+// changed/stopped track saves the tags but skips the refresh instead of UAF.
 void on_Save_clicked (GtkButton *b, gpointer user_data) {
-	deadbeef->pl_lock();
 	DB_playItem_t *track = static_cast<DB_playItem_t *>(user_data);
-	deadbeef->pl_unlock(); 
-	if (track){
-		save_meta_data( track, selected_lyrics);
-		DB_playItem_t *playing_track = deadbeef->streamer_get_playing_track_safe();
-		if (playing_track){
-			if (playing_track == track){
-				death_signal = 1;
-				auto tid = deadbeef->thread_start(update_lyrics, track);
-				deadbeef->thread_detach(tid);
-			}
-			else{
-				deadbeef->pl_item_unref(playing_track);
-			}
+	if (track)
+		save_meta_data(track, selected_lyrics);
+	DB_playItem_t *playing_track = deadbeef->streamer_get_playing_track_safe();
+	if (playing_track) {
+		if (track && playing_track == track) {
+			death_signal = 0;
+			// playing_track's reference is handed to update_lyrics(), which releases it.
+			intptr_t tid = deadbeef->thread_start(update_lyrics, playing_track);
+			if (tid) deadbeef->thread_detach(tid);
+			else deadbeef->pl_item_unref(playing_track);
 		}
-		deadbeef->pl_item_unref(track);
-		//gtk_label_set_text (GTK_LABEL(Title), (const gchar* ) "OK");
+		else {
+			deadbeef->pl_item_unref(playing_track);
+		}
 	}
 }
 
 void	on_row_double_clicked (GtkButton *b) {
 	selected_lyrics = {"",false};
 	selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(SongsTree));
-	gchar *provider, *value;
+	gchar *provider = NULL, *value = NULL;
 	GtkTreeIter iter;
 	GtkTreeModel *model;
 
-	if (gtk_tree_selection_get_selected(GTK_TREE_SELECTION(selection), &model, &iter) == FALSE){
+	if (gtk_tree_selection_get_selected(GTK_TREE_SELECTION(selection), &model, &iter) == FALSE)
 		return;
-	}
-	gtk_tree_model_get(model, &iter, 3, &provider,  -1);
-	gtk_tree_model_get(model, &iter, 4, &value,  -1);
+	gtk_tree_model_get(model, &iter, 3, &provider, 4, &value, -1);
 
-	if (strcmp(provider, "LRCLIB") == 0){
-		selected_lyrics = lrclib_lyrics_downloader(value);
+	if (provider && value) {
+		try {
+			if (strcmp(provider, "LRCLIB") == 0)            selected_lyrics = lrclib_lyrics_downloader(value);
+			else if (strcmp(provider, "MUSIC 163") == 0)    selected_lyrics = music_163_lyrics_downloader(value);
+			else if (strcmp(provider, "Megalobiz") == 0)    selected_lyrics = megalobiz_lyrics_downloader(value);
+			else if (strcmp(provider, "AZlyrics") == 0)     selected_lyrics = azlyrics_lyrics_downloader(value);
+			else if (strcmp(provider, "RCLyricsBand") == 0) selected_lyrics = rclyricsband_lyrics_downloader(value);
+			else if (strcmp(provider, "Apple Music") == 0)  selected_lyrics = paxsenix_apple_lyrics_downloader(value);
+			else if (strcmp(provider, "YouTube") == 0)      selected_lyrics = paxsenix_youtube_lyrics_downloader(value);
+			else if (strcmp(provider, "Musixmatch") == 0 && deadbeef->conf_get_int("lyricbar.enable_musixmatch", 0))
+				selected_lyrics = musixmatch_lyrics_downloader(value);
+		} catch (...) {
+			selected_lyrics = {"", false};
+		}
 	}
-	else if (strcmp(provider, "MUSIC 163") == 0){
-	    selected_lyrics = music_163_lyrics_downloader(value);
-	}
-	else if (strcmp(provider, "Megalobiz") == 0){
-		selected_lyrics = megalobiz_lyrics_downloader(value);
-	}
-	else if (strcmp(provider, "AZlyrics") == 0){
-		selected_lyrics = azlyrics_lyrics_downloader(value);
-	}
-	else if (strcmp(provider, "RCLyricsBand") == 0){
-		selected_lyrics = rclyricsband_lyrics_downloader(value);
-	}
-//	else if (strcmp(provider, "Spotify") == 0){
-//		selected_lyrics = spotify_lyrics_downloader(value);
-//	}
+	g_free(provider);
+	g_free(value);
 
-	gtk_label_set_label(PreViewLyrics,selected_lyrics.lyrics.c_str());
+	gtk_label_set_label(PreViewLyrics, selected_lyrics.lyrics.c_str());
 }
 
-void thread_listener_Megalobiz(string text_song, string text_artist){
-	vector<string> megalobiz_songs = megalobiz_get_songs(text_song, text_artist);
-	populate_tree_view(megalobiz_songs, "Megalobiz");
+// Runs one provider search on a worker thread. Scraper exceptions must never escape the thread.
+// The WinCtx is reffed for the whole job: reading win->gen here races with window close,
+// so populate_idle() re-checks the generation under the lock before touching the store.
+static void run_search(GtkTreeStore *store, WinCtx *win, const char *source, std::function<vector<string>()> fn) {
+	WinCtx *held = ref_win(win);
+	if (!held) { g_object_unref(store); return; }   // window closed before we started
+	vector<string> found;
+	try { found = fn(); } catch (const std::exception &e) {
+		cerr << "lyricbar: " << source << " search failed: " << e.what() << endl;
+	} catch (...) {}
+	populate_tree_view(std::move(found), source, store, held);
+	unref_win(held);
 }
 
-void thread_listener_LrcLib(string text_song, string text_artist, string text_album){	
-	deadbeef->pl_lock();
-	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
-	float length = deadbeef->pl_get_item_duration(track);
-	deadbeef->pl_item_unref(track);
-	deadbeef->pl_unlock();
-	int int_duration = static_cast<int>(length);
-	vector<string> lrclib_songs = lrclib_get_songs(text_song, text_artist, text_album, int_duration);
-	populate_tree_view(lrclib_songs, "LRCLIB");
-}
-
-void thread_listener_Not_working_now(string text_song, string text_artist){
-//	vector<string> spotify_songs = 	spotify_get_songs(text_song,text_artist);
-//	populate_tree_view(spotify_songs, "Spotify");
-	vector<string> azlyrics_songs = azlyrics_get_songs(text_song, text_artist);
-	populate_tree_view(azlyrics_songs, "AZlyrics");
-}
-
-void thread_listener_Music_163(string text_song, string text_artist){
-	vector<string> music_163_songs = music_163_get_songs(text_song, text_artist);
-	populate_tree_view(music_163_songs, "MUSIC 163");
-}
-	
-void thread_listener_RCLyricsBand(string text_song, string text_artist){	
-	vector<string> rclyricsband_songs = rclyricsband_get_songs(text_song, text_artist);
-	populate_tree_view(rclyricsband_songs, "RCLyricsBand");
-	
-}
-
-void on_Search_clicked (GtkButton *b) {
+void on_Search_clicked (GtkButton *b, gpointer user_data) {
+	WinCtx *win = static_cast<WinCtx *>(user_data);
+	unsigned gen = win ? ++win->gen : 0;   // invalidate results of any previous search
+	(void)gen;
 	gtk_tree_store_clear(treeStore);
-	string text_artist, text_song, text_album;
-	text_artist = specialtoplus(gtk_entry_get_text(Artist_input));
-	text_song = specialtoplus(gtk_entry_get_text(Song_input));
-	text_album = specialtoplus(gtk_entry_get_text(Album_input));
-	
-	thread LrcLib(thread_listener_LrcLib, text_song, text_artist, text_album);
-	thread Megalobiz(thread_listener_Megalobiz, text_song, text_artist);
-	thread Music_163(thread_listener_Music_163, text_song, text_artist);
-	thread RCLyricsBand(thread_listener_RCLyricsBand, text_song, text_artist);
-	thread Not_working_now(thread_listener_Not_working_now, text_song, text_artist);
+	string text_artist = specialtoplus(gtk_entry_get_text(Artist_input));
+	string text_song   = specialtoplus(gtk_entry_get_text(Song_input));
+	string text_album  = specialtoplus(gtk_entry_get_text(Album_input));
 
-//	printf("Songs  = %s\n; ", songs);
-	//gtk_label_set_text (GTK_LABEL(Title), (const gchar* ) "OK");
+	int int_duration = 0;
+	DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+	if (playing) {
+		int_duration = static_cast<int>(deadbeef->pl_get_item_duration(playing));
+		deadbeef->pl_item_unref(playing);
+	}
 
-	LrcLib.detach();
-	Megalobiz.detach();
-	Music_163.detach();
-    RCLyricsBand.detach();
-    Not_working_now.detach();
+	auto start = [&](const char *name, std::function<vector<string>()> fn) {
+		GtkTreeStore *store = treeStore;
+		g_object_ref(store);
+		try {
+			std::thread([store, win, name, fn] { run_search(store, win, name, fn); }).detach();
+		} catch (...) {
+			g_object_unref(store);
+		}
+	};
+	start("LRCLIB",       [=] { return lrclib_get_songs(text_song, text_artist, text_album, int_duration); });
+	start("Megalobiz",    [=] { return megalobiz_get_songs(text_song, text_artist); });
+	start("MUSIC 163",    [=] { return music_163_get_songs(text_song, text_artist); });
+	start("RCLyricsBand", [=] { return rclyricsband_get_songs(text_song, text_artist); });
+	start("AZlyrics",     [=] { return azlyrics_get_songs(text_song, text_artist); });
+
+	// Kopuz providers take raw entry text (a literal '+' must survive; their
+	// queries are URL-encoded downstream, not '+'-joined like the legacy ones).
+	string plain_song = gtk_entry_get_text(Song_input), plain_artist = gtk_entry_get_text(Artist_input);
+	start("Apple Music",  [=] { return paxsenix_apple_get_songs(plain_song, plain_artist); });
+	start("YouTube",      [=] { return paxsenix_youtube_get_songs(plain_song, plain_artist); });
+	if (deadbeef->conf_get_int("lyricbar.enable_musixmatch", 0))
+		start("Musixmatch", [=] { return musixmatch_get_songs(plain_song, plain_artist); });
 }
 
 void	on_Exit_clicked (GtkButton *b, gpointer user_data) {
@@ -525,8 +597,12 @@ void	on_Exit_clicked (GtkButton *b, gpointer user_data) {
 
 extern "C"
 int on_button_search (GtkMenuItem *menuitem, gpointer user_data) {
+	if (SearchWindow) {
+		gtk_window_present(SearchWindow);
+		return 0;
+	}
 
-	builder = gtk_builder_new_from_resource ("/src/panels.glade");
+	GtkBuilder *builder = gtk_builder_new_from_resource ("/src/panels.glade");
 
 	SearchWindow = GTK_WINDOW(gtk_builder_get_object(builder, "SearchWindow"));
 
@@ -572,20 +648,22 @@ int on_button_search (GtkMenuItem *menuitem, gpointer user_data) {
 	deadbeef->pl_lock();
 	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
 	if (track){
-		gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist"));
-		gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title"));
-		gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album"));	
+		gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist") ?: "");
+		gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title") ?: "");
+		gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album") ?: "");
 		deadbeef->pl_item_unref(track);
 	}
 	else{
 		ddb_playlist_t *plt = deadbeef->plt_get_curr();
 		if (plt) {
 			int cursor = deadbeef->pl_get_cursor (PL_MAIN);
-            track = deadbeef->pl_get_for_idx_and_iter (cursor, PL_MAIN);
-			gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist"));
-			gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title"));
-			gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album"));	
-			deadbeef->pl_item_unref(track);
+            track = cursor >= 0 ? deadbeef->pl_get_for_idx_and_iter (cursor, PL_MAIN) : NULL;
+			if (track) {
+				gtk_entry_set_text(Artist_input, deadbeef->pl_find_meta(track, "artist") ?: "");
+				gtk_entry_set_text(Song_input, deadbeef->pl_find_meta(track, "title") ?: "");
+				gtk_entry_set_text(Album_input, deadbeef->pl_find_meta(track, "album") ?: "");
+				deadbeef->pl_item_unref(track);
+			}
 			deadbeef->plt_unref(plt);
 			}
 	}
@@ -601,20 +679,19 @@ int on_button_search (GtkMenuItem *menuitem, gpointer user_data) {
 	selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(SongsTree));
 
 //	Signals:
-	g_signal_connect(SearchWindow, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+	WinCtx *search_ctx = track_window(SearchWindow, &SearchWindow, builder);
 	gtk_builder_connect_signals(builder, NULL);
 	g_signal_connect(SongsTree, "row-activated", G_CALLBACK(on_row_double_clicked), selection);
 	g_signal_connect(Save, "clicked", G_CALLBACK(on_Save_clicked), track);
 	g_signal_connect(Exit, "clicked", G_CALLBACK(on_Exit_clicked), SearchWindow);
-	g_signal_connect(Search, "clicked", G_CALLBACK(on_Search_clicked), NULL);
+	g_signal_connect(Search, "clicked", G_CALLBACK(on_Search_clicked), search_ctx);
 
 	gtk_widget_show(GTK_WIDGET(SearchWindow));
 	gtk_widget_grab_focus(GTK_WIDGET(SearchWindow));
 	gtk_window_set_keep_above(SearchWindow,1);
 
-	gtk_main();
-	
-	return EXIT_SUCCESS;
+
+	return 0;
 }
 
 //---------------------------------------------------------------------
@@ -683,7 +760,9 @@ string get_text_textview() {
 	GtkTextIter Start_iter, Finish_iter;
 	gtk_text_buffer_get_start_iter(GTK_TEXT_BUFFER(refBuffer), &Start_iter);
 	gtk_text_buffer_get_end_iter(GTK_TEXT_BUFFER(refBuffer), &Finish_iter);
-	string text = gtk_text_buffer_get_text(GTK_TEXT_BUFFER(refBuffer),&Start_iter, &Finish_iter, false);
+	gchar *raw = gtk_text_buffer_get_text(GTK_TEXT_BUFFER(refBuffer),&Start_iter, &Finish_iter, false);
+	string text = raw ? raw : "";
+	g_free(raw);
 	return text;
 }
 
@@ -714,7 +793,7 @@ string apply_offset(string lyrics) {
 		end = lyrics.find(squarebracket, start);
 		line = lyrics.substr(start, end - start);
 		int negative_or_not = 1;
-		if (line.at(0) == '-'){
+		if (!line.empty() && line.at(0) == '-') {
 			line = line.substr(1, -1);
 			negative_or_not = -1;
 		}
@@ -821,9 +900,11 @@ void	on_Edit_apply_clicked (GtkButton *b) {
 	}
 	deadbeef->pl_lock();
 	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
-	save_meta_data(track, {text, sync});
-	deadbeef->pl_item_unref(track);
 	deadbeef->pl_unlock();
+	if (track) {
+		save_meta_data(track, {text, sync});
+		deadbeef->pl_item_unref(track);
+	}
 }
 
 void	on_Edit_OK_clicked (GtkButton *b, gpointer user_data) {
@@ -834,8 +915,12 @@ void	on_Edit_OK_clicked (GtkButton *b, gpointer user_data) {
 
 extern "C"
 int on_button_edit (GtkMenuItem *menuitem, gpointer user_data) {
+	if (EditWindow) {
+		gtk_window_present(EditWindow);
+		return 0;
+	}
 
-	builder = gtk_builder_new_from_resource ("/src/panels.glade");
+	GtkBuilder *builder = gtk_builder_new_from_resource ("/src/panels.glade");
 
 	EditWindow = GTK_WINDOW(gtk_builder_get_object(builder, "EditWindow"));
 
@@ -866,7 +951,7 @@ int on_button_edit (GtkMenuItem *menuitem, gpointer user_data) {
 	gtk_window_set_title(EditWindow, _("Edit"));
 
 	DB_playItem_t *track = deadbeef->streamer_get_playing_track_safe();
-	struct parsed_lyrics track_lyrics;
+	struct parsed_lyrics track_lyrics{};
 
 	if (track){
 		track_lyrics = get_lyrics_from_metadata(track);
@@ -877,13 +962,13 @@ int on_button_edit (GtkMenuItem *menuitem, gpointer user_data) {
 	update_text_textview(track_lyrics.lyrics);
 
 //	Signals:
-	g_signal_connect(EditWindow, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+	WinCtx *edit_ctx = track_window(EditWindow, &EditWindow, builder);
 	gtk_builder_connect_signals(builder, NULL);
 
 	g_signal_connect(Backward, "clicked", G_CALLBACK(on_Backward_clicked), NULL);
 	g_signal_connect(Pause_play, "clicked", G_CALLBACK(on_Pause_play_clicked), NULL);
 	g_signal_connect(Forward, "clicked", G_CALLBACK(on_Forward_clicked), NULL);
-	g_timeout_add (10 /* milliseconds */, on_timeout, Playback_time);
+	edit_ctx->timeout_id = g_timeout_add(50 /* milliseconds */, on_timeout, Playback_time);
 	g_signal_connect(Plus_time, "clicked", G_CALLBACK(on_Plus_time_clicked), NULL);
 	g_signal_connect(Minus_time, "clicked", G_CALLBACK(on_Minus_time_clicked), NULL);
 	g_signal_connect(Apply_offset, "clicked", G_CALLBACK(on_Apply_offset_clicked), NULL);
@@ -905,9 +990,8 @@ int on_button_edit (GtkMenuItem *menuitem, gpointer user_data) {
 	gtk_widget_grab_focus(GTK_WIDGET(EditWindow));
 	gtk_window_set_keep_above(EditWindow,1);
 
-	gtk_main();
-	
-	return EXIT_SUCCESS;
+
+	return 0;
 }
 
 
