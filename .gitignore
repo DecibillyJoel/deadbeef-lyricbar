@@ -60,3 +60,7 @@ dkms.conf
 src/resources.c
 src/resources.h
 
+# msgmerge backups and compiled translation catalogues
+*.po~
+*.mo
+
