@@ -14,6 +14,13 @@
 #include <string>
 #include <pthread.h>
 #include <mutex>
+#include <atomic>
+#include <memory>
+#include <algorithm>
+#include <map>
+#include <chrono>
+#include <cstring>
+#include "lyrics_finder.h"
 
 
 using namespace std;
@@ -25,17 +32,10 @@ using namespace std;
 
 
 
-mutex mtx;
-
-int death_signal    = 0;
+int death_signal = 0;   // set from the GTK thread, read by listener threads (int reads/writes are atomicTarget-independent single-copy; see note below)
 bool lyricstart     = false;
 bool syncedlyrics   = false;
-int previous_pad    = 0;
 struct timespec ts  = {0, 50000000};
-vector<int> linessizes;
-struct sync lrc;
-struct sync_view lrc_view;
-vector<int> linescharactersizes;
 
 
 // For debug:
@@ -58,90 +58,57 @@ bool is_playing(DB_playItem_t *track) {
 //************ Functions to make scroll on sync lyrics. ***************
 //---------------------------------------------------------------------
 
-// Functions to bubble sort lyrics and timestamps.
-void swap(double *xp, double *yp)
-{
-    double temp = *xp;
-    *xp = *yp;
-    *yp = temp;
-}
-
-void swaptext(string *xp, string *yp)
-{
-    string temp = *xp;
-    *xp = *yp;
-    *yp = temp;
-}
-
-// Fuctions to order lyrics and timestamps.
-struct sync bubbleSort(vector<double> arr, vector<string> text ,  int n)
-{
-	if ((arr.size() == 0) || (text.size() != arr.size())){
-		vector<double> nullposition;
-		vector<string> errortext;
-		nullposition.push_back(0);
-		errortext.push_back(_("Error with lyrics file or metadata"));
-		cout << "Error with lyrics file or metadata \n";
-		struct sync error = {errortext, nullposition};
-		return error;
+// Sort lyrics by timestamp (stable, keeps text paired with its time).
+static struct sync sort_lyrics(const vector<double> &arr, const vector<string> &text) {
+	struct sync result;
+	if (arr.empty() || text.size() != arr.size()) {
+		result.position.push_back(0);
+		result.synclyrics.push_back(_("Error with lyrics file or metadata"));
+		return result;
 	}
-	else{
-    	int i, j;
-    	for (i = 0; i < n-1; i++){   
-    		// Last i elements are already in place.
-    		for (j = 0; j < n-i-1; j++){
-        		if (arr[j] > arr[j+1]){
-        		    swap(&arr[j], &arr[j+1]);
-					swaptext(&text[j], &text[j+1]);
-				}
-			}
+	vector<size_t> idx(arr.size());
+	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+	stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return arr[x] < arr[y]; });
+	for (size_t i : idx) {
+		result.position.push_back(arr[i]);
+		result.synclyrics.push_back(text[i]);
+	}
+	return result;
+}
+
+static inline bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// Parse LRC text: "[mm:ss.xx]text", several timestamps per line allowed.
+struct sync lyric2vector(const string &lyrics) {
+	vector<string> texts;
+	vector<double> times;
+	size_t start = 0;
+	while (start <= lyrics.size()) {
+		size_t end = lyrics.find('\n', start);
+		if (end == string::npos) end = lyrics.size();
+		string line = lyrics.substr(start, end - start);
+		start = end + 1;
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+
+		vector<double> line_times;
+		size_t pos = 0;
+		while (pos + 9 <= line.size() && line[pos] == '[' && is_digit(line[pos+1]) && is_digit(line[pos+2])
+		       && line[pos+3] == ':' && is_digit(line[pos+4]) && is_digit(line[pos+5])
+		       && line[pos+6] == '.' && is_digit(line[pos+7]) && is_digit(line[pos+8])) {
+			line_times.push_back((line[pos+1]-'0')*600 + (line[pos+2]-'0')*60 + (line[pos+4]-'0')*10
+			                     + (line[pos+5]-'0') + (line[pos+7]-'0')*0.1 + (line[pos+8]-'0')*0.01);
+			pos += 9;
+			while (pos < line.size() && line[pos] != ']') pos++;
+			if (pos < line.size()) pos++;
 		}
-	struct sync retur = {text,arr};
-	return retur;
-	}
-}
-
-// Function to parse synced lyrics:
-struct sync lyric2vector( string lyrics){
-	//cout << "lyric2vector" "\n";
-	vector<string> synclyrics;
-	vector<double> position;
-	string line;
-	int squarebracket;
-	int repeats = 0; 
-	//If last character is a ] add an space to have same number of lyrics and positions.
-	if (lyrics.at(lyrics.length() - 1) == ']'){
-		lyrics.push_back(' ');
-	}
-	if (lyrics.length() <= 3){
-		position.push_back(0);
-		struct sync  emptylyrics = bubbleSort(position, synclyrics, 1);
-		return emptylyrics;
-	}
-
-	for (unsigned i=0; i < lyrics.length() - 3; ++i){
-		if ((lyrics.at(i) == '[') && (lyrics.at(i+3) == ':') && (lyrics.at(i+6) == '.') ) {
-  			++repeats;
-			position.push_back ((lyrics.at(i + 1) - 48)*600 + (lyrics.at(i + 2) - 48)*60 + (lyrics.at(i + 4) - 48)*10 + (lyrics.at(i + 5) - 48) + (lyrics.at(i + 7) - 48)*0.1 + (lyrics.at(i + 8) - 48)*0.01);
-			if ((lyrics.length() > i + 10) && (lyrics.at(i+10) != '[')) {
-				line = lyrics.substr(i + 10, lyrics.length() - i - 10);
-				squarebracket = line.find_first_of('[');
-				if (((lyrics.at(i+8 + squarebracket)) != '\n') && (lyrics.at(i+8 + squarebracket)) != '\r'){
-                    line = lyrics.substr(i + 10, squarebracket-1);
-				}
-				else {
-                    line = lyrics.substr(i + 10, squarebracket-2);
-				}
-				++repeats;
-				while (--repeats ) {
-					synclyrics.push_back (line);
-				}	
-			}
+		if (line_times.empty()) continue;
+		string text = line.substr(min(pos, line.size()));
+		for (double t : line_times) {
+			times.push_back(t);
+			texts.push_back(text);
 		}
 	}
-
-	int n = position.size();
-	struct sync  goodlyrics = bubbleSort(position, synclyrics, n);
+	struct sync goodlyrics = sort_lyrics(times, texts);
 
 // For debug:
 //	for (auto k = goodlyrics.position.begin(); k != goodlyrics.position.end(); ++k)
@@ -153,118 +120,121 @@ struct sync lyric2vector( string lyrics){
 	return goodlyrics;
 }
 
-// Function to scroll and remark line:
-void write_synced( DB_playItem_t *it){
+// Everything the listener thread needs, immutable once built.
+struct sync_state {
+	struct sync lrc;
+	vector<int> sizes;
+};
+
+static std::atomic<unsigned> listener_generation{0};
+
+// Scroll and highlight the current line. Skips the GTK update when nothing visible changed.
+static void write_synced(DB_playItem_t *it, const sync_state &st, int &previous_pad, string &last_key) {
+	const struct sync &l = st.lrc;
+	const vector<int> &sizes = st.sizes;
 	float pos = deadbeef->streamer_get_playpos();
-	int presentpos = 0;
-	int minimuntopad = 0;
-	int pad = 0;
-	string past = "";
-	string present = "";
-	string future = "";
-	string padding = "";
-	
-	//If to avoid write again when nothing has changed or DeadBeef is paused.
-	if ((lrc.position.size() < 2) || (deadbeef->get_output()->state() == 2)) {
+	int presentpos = 0, minimuntopad = 0, pad = 0;
+	string past, present, future, padding;
+
+	if (l.position.size() < 3 || l.synclyrics.size() != l.position.size())
 		return;
-	}
-	
-	//Set actual line, and fill future with next lines.
-	for (unsigned i = 0; i < lrc.position.size()-2; i++){
-		if (lrc.position[i] < pos){
-			if (lrc.position[i+1] > pos){
-				present = " ";
-				present.append(lrc.synclyrics[i]);
-				present.append(" ");
-				present.append("\n");
-				presentpos = i;
+	DB_output_t *out = deadbeef->get_output();
+	if (out && out->state() == DDB_PLAYBACK_STATE_PAUSED)
+		return;
+
+	for (size_t i = 0; i + 2 < l.position.size(); i++) {
+		if (l.position[i] < pos) {
+			if (l.position[i+1] > pos) {
+				present = " " + l.synclyrics[i] + " \n";
+				presentpos = (int)i;
 			}
 		}
-		else if (pos < lrc.position[i]){
-				future.append(lrc.synclyrics[i]);
-				future.append("\n");
+		else if (pos < l.position[i]) {
+			future.append(l.synclyrics[i]);
+			future.append("\n");
 		}
 	}
-	
-	//Add padding variable at beginning of lyrics to show to make scroll with first lines.
-	if (!linessizes.empty() && (size_t)(linessizes[1]+1) < lrc.position.size()){
-	    pad = int((lrc.position[linessizes[1]+1] - pos)/(lrc.position[linessizes[1]+1])*linessizes[0]);
-	    if (pad == previous_pad){
-	        return; //If to avoid write again when nothing has changed.
-	    }
-		padding.assign(std::max(0, pad), '\n');
-	    if (pad > 0){
-	        previous_pad = pad;	//Update only when is really something to pad to don't override next use of pad/previous_pad.
-	    }	
+
+	if (sizes.size() >= 2) {
+		int top = sizes[1];
+		size_t nxt = (size_t)max(0, top) + 1;
+		if (nxt < l.position.size() && l.position[nxt] > 0) {
+			pad = int((l.position[nxt] - pos) / l.position[nxt] * sizes[0]);
+			if (pad == previous_pad) return;
+			padding.assign(max(0, pad), '\n');
+			if (pad > 0) previous_pad = pad;
+		}
+
+		size_t sidx = (size_t)(presentpos - top + 5);
+		if ((presentpos - top) > 0 && (size_t)(presentpos + 1) < l.position.size() && sidx < sizes.size()) {
+			minimuntopad = presentpos - top;
+			double span = l.position[presentpos+1] - l.position[presentpos];
+			if (span > 0) {
+				pad = int(((l.position[presentpos+1] - pos) / span) * (sizes[sidx] - 1));
+				if (pad == previous_pad) return;
+				padding.assign(max(0, pad), '\n');
+				previous_pad = pad;
+			}
+		}
 	}
 
-	//Add padding variable at beginning of lyrics to show to make scroll when removing a past line.
-	if (((!linessizes.empty()) && (presentpos - linessizes[1]) > 0) && (size_t)(presentpos+1) < lrc.position.size()){
-		minimuntopad = presentpos - linessizes[1];
-		pad = int(((lrc.position[presentpos +1] - pos)/(lrc.position[presentpos+1]
-		     -lrc.position[presentpos]))*(linessizes[presentpos - linessizes[1] + 5] -1));
-	    if (pad == previous_pad){
-	        return; //"if" to avoid write again when nothing has changed.
-	    }
-		padding.assign(std::max(0, pad), '\n');
-        previous_pad = pad;
-	}
+	for (size_t i = (size_t)minimuntopad; i + 2 < l.position.size() && l.position[i+1] < pos; i++)
+		past.append(l.synclyrics[i] + "\n");
 
-	//Removing first past lyrics lines to make scroll.
-	for (unsigned i = minimuntopad; i < lrc.position.size()-2 && lrc.position[i+1] < pos; i++){
-		past.append(lrc.synclyrics[i] + "\n");
-	}
-//		cout << "Pos: " << pos << " min2pad: " << minimuntopad << " lrc.position[minimuntopad + 1]: " << lrc.synclyrics[minimuntopad + 1] << "                                 " << "LCS: " << linescharactersizes.size() << "\t\r" << std::flush;
+	string key = to_string(past.size()) + "|" + present + "|" + to_string(padding.size());
+	if (key == last_key) return;
+	last_key = key;
 	set_lyrics(it, past, present, future, padding);
 }
 
-// Main loop to update lyrics on real time.
-void thread_listener(DB_playItem_t *track){
-
-	if ((is_playing(track)) && death_signal == 0){
+// Realtime update loop. Ends when the track changes or a newer listener starts.
+static void thread_listener(DB_playItem_t *track, shared_ptr<sync_state> st, unsigned gen) {
+	int previous_pad = 0;
+	string last_key;
+	// NOTE: death_signal is a plain int read without a lock by listener threads. On all
+// supported targets a 4-byte aligned int load/store is single-copy atomic, and the
+// flag is only ever 0 or 1, so the worst case is one extra 50 ms loop iteration.
+// listener_generation (above) is the real synchronisation primitive.
+while (gen == listener_generation.load() && !death_signal && is_playing(track)) {
 		nanosleep(&ts, NULL);
-		write_synced(track);
-		thread_listener(track);
+		try {
+			write_synced(track, *st, previous_pad, last_key);
+		} catch (const std::exception &e) {
+			cerr << "lyricbar: " << e.what() << endl;
+			break;
+		}
 	}
-	else{
-		pthread_exit (NULL);
-	}
+	deadbeef->pl_item_unref(track);
 }
 
-// Main loop thread caller.
-void chopset_lyrics(DB_playItem_t *track, string lyrics){
-//	cout << "Chopset lyrics" "\n";
-	lrc = lyric2vector(lyrics);
-	DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
-	float length = deadbeef->pl_get_item_duration(it);
-	
-    linescharactersizes.clear();
-	lrc.position.push_back((float)length -0.2);
-	lrc.position.push_back((float)length);
-	lrc.synclyrics.push_back("\n");
-	lrc.synclyrics.push_back("\n");
-	string prelyrics = "";
-	
-	for (unsigned i = 0; i < lrc.synclyrics.size()-2; i++){
-		prelyrics.append(lrc.synclyrics[i] + "\n");
-//		linescharactersizes.push_back(lrc.synclyrics[i].size());
-	}
-//	for (unsigned i = 0; i < linescharactersizes.size()-2; i++){
-//	    cout << linescharactersizes[i] << " ";
-//	}
-	
-	linescharactersizes.push_back(1);
-	linescharactersizes.push_back(1);
-	
-	if (track == it){
-		linessizes = sizelines(track, prelyrics);
-	}
+// Parse `lyrics`, measure line sizes on the UI thread, start the listener. Thread owns a ref on `track`.
+void chopset_lyrics(DB_playItem_t *track, string lyrics) {
+	auto st = make_shared<sync_state>();
+	st->lrc = lyric2vector(lyrics);
 
-	mtx.lock();
-	thread t1(thread_listener, it);
-	t1.detach();
-	deadbeef->pl_item_unref(it);
-	mtx.unlock();
+	DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
+	if (!it) return;
+	if (it != track) { deadbeef->pl_item_unref(it); return; }
+
+	float length = deadbeef->pl_get_item_duration(it);
+	st->lrc.position.push_back((double)length - 0.2);
+	st->lrc.position.push_back((double)length);
+	st->lrc.synclyrics.push_back("\n");
+	st->lrc.synclyrics.push_back("\n");
+
+	string prelyrics;
+	for (size_t i = 0; i + 2 < st->lrc.synclyrics.size(); i++)
+		prelyrics.append(st->lrc.synclyrics[i] + "\n");
+
+	st->sizes = sizelines(track, prelyrics);
+
+	unsigned gen = ++listener_generation;
+	try {
+		std::thread t(thread_listener, it, st, gen);
+		t.detach();
+	} catch (...) {
+		deadbeef->pl_item_unref(it);
+	}
 }
 
 //---------------------------------------------------------------------
@@ -280,32 +250,24 @@ void chopset_lyrics(DB_playItem_t *track, string lyrics){
 void save_meta_data(DB_playItem_t *playing_song, struct parsed_lyrics lyrics){
 
 	deadbeef->pl_lock();
-	const char *SYLT = deadbeef->pl_find_meta(playing_song, "SYLT");
-	const char *LYRICS = deadbeef->pl_find_meta(playing_song, "LYRICS");
-	const char *UNSYNCEDLYRICS = deadbeef->pl_find_meta(playing_song, "UNSYNCEDLYRICS");
-	deadbeef->pl_unlock();
-	if (lyrics.sync == true){	
-		if (SYLT){
+	if (lyrics.sync == true){
+		if (deadbeef->pl_find_meta(playing_song, "SYLT"))
 			deadbeef->pl_delete_meta(playing_song, "SYLT");
-		}
-
-		if (LYRICS){
+		if (deadbeef->pl_find_meta(playing_song, "LYRICS"))
 			deadbeef->pl_delete_meta(playing_song, "LYRICS");
-		}
-		deadbeef->pl_add_meta(playing_song, "LYRICS", lyrics.lyrics.c_str());	
+		deadbeef->pl_add_meta(playing_song, "LYRICS", lyrics.lyrics.c_str());
 	}
 	else{
-		if (UNSYNCEDLYRICS){
+		if (deadbeef->pl_find_meta(playing_song, "UNSYNCEDLYRICS"))
 			deadbeef->pl_delete_meta(playing_song, "UNSYNCEDLYRICS");
-		}
 		deadbeef->pl_add_meta(playing_song, "UNSYNCEDLYRICS", lyrics.lyrics.c_str());	
 	}
-	deadbeef->pl_lock(); 
 	const char *dec = deadbeef->pl_find_meta_raw(playing_song, ":DECODER"); 
-	char decoder_id[100];
+	char decoder_id[100] = {0};
 
 	if (dec){
-		strncpy(decoder_id, dec, sizeof(decoder_id));
+		strncpy(decoder_id, dec, sizeof(decoder_id) - 1);
+		decoder_id[sizeof(decoder_id) - 1] = 0;
 	}
 	int match = playing_song && dec;
 	deadbeef->pl_unlock();
@@ -314,7 +276,7 @@ void save_meta_data(DB_playItem_t *playing_song, struct parsed_lyrics lyrics){
 		DB_decoder_t *dec = NULL;
 		DB_decoder_t **decoders = deadbeef->plug_get_decoder_list();
 
-		for (int i = 0; decoders[i]; i++){
+		for (int i = 0; decoders && decoders[i]; i++){
 
 			if (!strcmp(decoders[i]->plugin.id, decoder_id)){
 				dec = decoders[i];
@@ -387,19 +349,21 @@ vector<string> split(string s, string delimiter) {
     return res;
 }
 
-// Function to parse webpages.
+// Function to parse webpages. Takes ownership of (and frees) `slist`.
 string text_downloader(curl_slist *slist, string url, string post) {
 	CURL *curl_handle;
 	curl_handle = curl_easy_init();
 	string readBuffer = "";
-	if (curl_handle) {	
-		curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 600);
-		curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0);
-		curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0);
+	if (curl_handle) {
+		curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
+		curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 8L);
+		curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
+		curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 1L);
+		curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);
 		curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 0);
 		curl_easy_setopt(curl_handle, CURLOPT_HEADER, 0);
 		curl_easy_setopt(curl_handle, CURLOPT_ENCODING, NULL);
-		curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, false);
+		curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
 		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist);
 		if (post != ""){
 			curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "POST");
@@ -411,9 +375,11 @@ string text_downloader(curl_slist *slist, string url, string post) {
 		curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteCallback);
 		curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &readBuffer);
-		curl_easy_perform(curl_handle);
+		CURLcode rc = curl_easy_perform(curl_handle);
 		curl_easy_cleanup(curl_handle);
+		if (rc != CURLE_OK) readBuffer.clear();
 	}
+	curl_slist_free_all(slist);
 	return readBuffer;
 }
 
@@ -439,74 +405,55 @@ void ensure_lyrics_path_exists() {
 //---------------------------------------------------------------------
 
 struct parsed_lyrics get_lyrics_next_to_file(DB_playItem_t *track) {
-	bool sync = false;
-	bool first_timestamped = false;
-	int total_lines = 1;
-	int timestamped_lines = 1;
 	ifstream infile;
 	string lyrics;
 	string line;
 
 	deadbeef->pl_lock();
 	const char *track_location = deadbeef->pl_find_meta(track, ":URI");
+	string trackstring = track_location ? track_location : "";
 	deadbeef->pl_unlock();
-	string trackstring = track_location;
+	if (trackstring.empty() || trackstring.find("://") != string::npos)
+		return {"", false};
 	size_t lastindex = trackstring.find_last_of(".");
 	trackstring = trackstring.substr(0, lastindex);
-	infile.open(trackstring + ".lrc", ios_base::out);
+	infile.open(trackstring + ".lrc", ios_base::in);
 	if (!infile.is_open()){
-	    infile.open(trackstring + ".txt", ios_base::out);
+	    infile.clear();
+	    infile.open(trackstring + ".txt", ios_base::in);
 	}
 	
 	if(infile.is_open()){
 		while (getline(infile, line)) {
 		    lyrics = lyrics + line + "\n";
-		    
-		    if (line.length() > 4){
-		        for (unsigned i=0; i < line.length() - 3; ++i){
-		            if ((line.at(i) == '[') && (line.at(i+3) == ':') && (line.at(i+6) == '.') ) {
-		                first_timestamped = true;
-		                timestamped_lines += 1;
-		            }
-		        }
-		    }
-		    if (first_timestamped == true){
-		        total_lines += 1;
-		    }
 		}
-		if ((timestamped_lines*100/total_lines > 75) && (total_lines != 1)){
-			sync = true;		
-		};
-			
 	}
-	return{lyrics, sync};	
+	return {lyrics, lyricfinder::looks_synced(lyrics)};
 }
 
 struct parsed_lyrics get_lyrics_from_metadata(DB_playItem_t *track) {
-	syncedlyrics = true;
 	deadbeef->pl_lock();
 	const char *lyrics = deadbeef->pl_find_meta(track, "lyrics")
-							?: deadbeef->pl_find_meta(track, "SYLT");
-	if (!lyrics) {
-		syncedlyrics = false;
-		lyrics = deadbeef->pl_find_meta(track, "unsynced lyrics")
-	                  ?: deadbeef->pl_find_meta(track, "UNSYNCEDLYRICS");
-		if (!lyrics) {
-			lyrics = "";
-		}
-	}
+							?: deadbeef->pl_find_meta(track, "SYLT")
+							?: deadbeef->pl_find_meta(track, "unsynced lyrics")
+							?: deadbeef->pl_find_meta(track, "UNSYNCEDLYRICS");
+	string string_lyrics = lyrics ? lyrics : "";
 	deadbeef->pl_unlock();
-	string string_lyrics = lyrics;
-	return {string_lyrics, syncedlyrics};
+	// Classify by content, not tag name: a plain LYRICS tag must not read as synced.
+	bool is_sync = !string_lyrics.empty() && lyricfinder::looks_synced(string_lyrics);
+	syncedlyrics = is_sync;
+	return {string_lyrics, is_sync};
 }
 
 
 void save_next_to_file(DB_playItem_t *track, struct parsed_lyrics lyrics) {
 	deadbeef->pl_lock();
 	const char *track_location = deadbeef->pl_find_meta(track, ":URI");
+	string trackstring = track_location ? track_location : "";
 	deadbeef->pl_unlock();
+	if (trackstring.empty() || trackstring.find("://") != string::npos)
+		return;
 	ofstream outfile;
-	string trackstring = track_location;
 	size_t lastindex = trackstring.find_last_of(".");
 	trackstring = trackstring.substr(0, lastindex);
 	
@@ -525,6 +472,10 @@ void save_next_to_file(DB_playItem_t *track, struct parsed_lyrics lyrics) {
 		catch (...)	{
 			std::cout << "Unable to write file\n";
 		}
+	}
+	if (!outfile.is_open()) {
+		cerr << "lyricbar: unable to write lyrics file" << endl;
+		return;
 	}
 	outfile << lyrics.lyrics << endl;
 	outfile.close();
@@ -551,39 +502,27 @@ void set_info(DB_playItem_t *track) {
     
     //INVOLVED_PEOPLE_LIST and GENRE are a little more tricky to retrieve.
     DB_metaInfo_t *involved_people_meta = deadbeef->pl_meta_for_key (track, "InvolvedPeople");
-    deadbeef->pl_unlock();
-    
-    deadbeef->pl_lock();
 	int playcount = deadbeef->playqueue_get_count();
 	int bitrate = deadbeef->streamer_get_apx_bitrate();
-	deadbeef->pl_unlock();
 
-	while (bitrate == -1){
-		bitrate = deadbeef->streamer_get_apx_bitrate();
-	}
-    
-    void *involved_buffer = malloc(100000);
-    char *p2 = (char *)involved_buffer;
-    *p2 = 0;
-    size_t buffer_size = 100000;
+    std::string involved_buf;
     const char *involved_people = NULL;
 
-    if (involved_people_meta != NULL) {
-        size_t value_size = involved_people_meta->valuesize;
-        if (value_size > buffer_size - 1) {
-            value_size = buffer_size - 1;
-        }
-        memcpy(p2, involved_people_meta->value, value_size);
-        char *p = p2;
-        for (size_t i = 0; i <= value_size; i++, p++) {
-            if (*p == 0) {
-                *p = '\n';
-            }
-        }
-        p2[value_size] = 0;
-        involved_people = p2;
+    if (involved_people_meta != NULL && involved_people_meta->value) {
+        size_t value_size = min<size_t>(involved_people_meta->valuesize, 100000);
+        involved_buf.assign(involved_people_meta->value, value_size);
+        for (char &c : involved_buf) if (c == 0) c = '\n';
+        involved_people = involved_buf.c_str();
     }
-    
+    // Copy the strings still needed below, then release the lock.
+    string s_first = firs ? firs : "", s_last = las ? las : "", s_pub = publisher ? publisher : "",
+           s_media = media ? media : "", s_cat = catalog_number ? catalog_number : "",
+           s_country = release_country ? release_country : "", s_orig = original_date ? original_date : "",
+           s_genre = genre ? genre : "";
+    bool has_first = firs, has_last = las, has_pub = publisher, has_media = media && catalog_number && release_country,
+         has_orig = original_date, has_genre = genre;
+    deadbeef->pl_unlock();
+
 	info.append("\n \n");
 
 	if (count == -1){
@@ -601,13 +540,13 @@ void set_info(DB_playItem_t *track) {
 			info.append("\n \n");
 	}
 
-	if (firs != NULL) {
-		string first = firs;	
+	if (has_first) {
+		string first = s_first;
 		info.append(_("For the first time "));
-		info.append(first.substr(0,10));
+		info.append(first.substr(0, min<size_t>(10, first.size())));
 		info.append("\n");
 		info.append(_("at "));
-		info.append(first.substr(11, first.length() -1));
+		info.append((first.size() > 11 ? first.substr(11) : string()));
 		info.append("\n \n");
 	}
 	else{
@@ -615,13 +554,13 @@ void set_info(DB_playItem_t *track) {
 		info.append("\n \n");
 	}
 
-	if (las != NULL) {
-		string last = las;
+	if (has_last) {
+		string last = s_last;
 		info.append(_("For the last time the "));
-		info.append(last.substr(0,10));
+		info.append(last.substr(0, min<size_t>(10, last.size())));
 		info.append("\n");
 		info.append(_("at "));
-		info.append( last.substr(11, last.length() -1));
+		info.append( (last.size() > 11 ? last.substr(11) : string()));
 		info.append("\n \n");
 	}
 
@@ -640,30 +579,30 @@ void set_info(DB_playItem_t *track) {
 		info.append("\n \n");
 	}
 	
-	if (publisher != NULL) {
+	if (has_pub) {
 	    info.append(_("Publisher: "));
-	    info.append(publisher);
+	    info.append(s_pub);
 	    info.append("\n \n");
 	}
 	
-	if (media != NULL && catalog_number != NULL && release_country != NULL) {
-	    info.append(media);
+	if (has_media) {
+	    info.append(s_media);
 	    info.append(" - ");
-	    info.append(catalog_number);
+	    info.append(s_cat);
 	    info.append(" - ");
-	    info.append(release_country);
-	    info.append("\n \n");
-	}
-	
-	if (original_date != NULL) {
-	    info.append(_("Released date: "));
-	    info.append(original_date);
+	    info.append(s_country);
 	    info.append("\n \n");
 	}
 
-	if (genre != NULL) {
+	if (has_orig) {
+	    info.append(_("Released date: "));
+	    info.append(s_orig);
+	    info.append("\n \n");
+	}
+
+	if (has_genre) {
 	    info.append(_("Genre: "));
-	    info.append(genre);
+	    info.append(s_genre);
 	    info.append("\n \n");
 	}
 
@@ -694,76 +633,103 @@ void set_info(DB_playItem_t *track) {
 	set_lyrics(track, info, "",  "", "");
 }
 
-//Main function:
-void update_lyrics(void *tr) {
-	linessizes.clear();
-	DB_playItem_t *track = static_cast<DB_playItem_t*>(tr);
-	struct parsed_lyrics meta_lyrics = get_lyrics_from_metadata(track);
-	if (meta_lyrics.lyrics != "") {
-		if (meta_lyrics.sync == true) {
-			chopset_lyrics(track, meta_lyrics.lyrics);
-		}
-		else{
-			set_lyrics(track, "", "", meta_lyrics.lyrics, "");
-		}
-		sync_or_unsync(meta_lyrics.sync);
-	return;
+static void show_lyrics(DB_playItem_t *track, const parsed_lyrics &l) {
+	if (l.sync) chopset_lyrics(track, lyricfinder::normalize_lrc(l.lyrics));
+	else set_lyrics(track, "", "", l.lyrics, "");
+	sync_or_unsync(l.sync);
+}
+
+// Tracks no provider had lyrics for (30 min), so replaying them skips the network.
+static std::mutex miss_mutex;
+static std::map<string, std::chrono::steady_clock::time_point> misses;
+
+static bool recently_missed(const string &key) {
+	std::lock_guard<std::mutex> lk(miss_mutex);
+	auto it = misses.find(key);
+	if (it == misses.end()) return false;
+	if (std::chrono::steady_clock::now() - it->second > std::chrono::minutes(30)) { misses.erase(it); return false; }
+	return true;
+}
+
+static void remember_miss(const string &key) {
+	std::lock_guard<std::mutex> lk(miss_mutex);
+	misses[key] = std::chrono::steady_clock::now();
+}
+
+static void update_lyrics_impl(DB_playItem_t *track) {
+	// 1. Lyrics already stored with the track (tag, then .lrc/.txt next to the file).
+	struct parsed_lyrics local = get_lyrics_from_metadata(track);
+	if (local.lyrics.empty())
+		local = get_lyrics_next_to_file(track);
+
+	bool have_local = !local.lyrics.empty();
+	if (have_local) {
+		show_lyrics(track, local);
+		if (local.sync) return;
 	}
 
-	const char *artist;
-	const char *title;
+	// 2. Automatic online lookup, honoring the autosearch and upgrade settings.
+	bool autosearch = deadbeef->conf_get_int("lyricbar.autosearch.enable", 1) != 0;
+	bool upgrade = deadbeef->conf_get_int("lyricbar.upgrade_unsynced", 1) != 0;
+	if (!autosearch || (have_local && !upgrade)) {
+		if (!have_local) set_info(track);
+		return;
+	}
+
+	lyricfinder::Query q;
 	{
 		deadbeef->pl_lock();
-		artist = deadbeef->pl_find_meta(track, "artist") ?: _("Unknown Artist");
-		title  = deadbeef->pl_find_meta(track, "title") ?: _("Unknown Title");
+		const char *t = deadbeef->pl_find_meta(track, "title");
+		const char *a = deadbeef->pl_find_meta(track, "artist");
+		const char *al = deadbeef->pl_find_meta(track, "album");
+		q.title = t ? t : "";
+		q.artist = a ? a : "";
+		q.album = al ? al : "";
 		deadbeef->pl_unlock();
 	}
+	q.duration = deadbeef->pl_get_item_duration(track);
+	q.musixmatch = deadbeef->conf_get_int("lyricbar.enable_musixmatch", 0) != 0;
 
-
-
-	if (artist && title) {
-		struct parsed_lyrics cached_lyrics = get_lyrics_next_to_file(track);
-
-		if (cached_lyrics.lyrics != "") {
-			if (cached_lyrics.sync == true) {
-				chopset_lyrics(track, cached_lyrics.lyrics);
-			}
-			else{
-				set_lyrics(track, "", "", cached_lyrics.lyrics, "");
-			}
-			sync_or_unsync(cached_lyrics.sync);
-			return;
-		}
+	string key = q.artist + "|" + q.title + "|" + std::to_string((int)q.duration) + (q.musixmatch ? "|mxm" : "");
+	if (q.title.empty() || recently_missed(key)) {
+		if (!have_local) set_info(track);
+		return;
 	}
-	set_lyrics(track, "", "", _("Loading..."), "");
 
-//	 No lyrics in the tag or cache; try to get some and cache if succeeded.
-//	Search for lyrics on LRCLIB:
-    if (deadbeef->conf_get_float("lyricbar.fontscale", 1) == 1){
-    	struct parsed_lyrics lrclib_lyrics = {"",false};
-    	lrclib_lyrics = lrclib(string(title), string(artist), "");
-    	if (lrclib_lyrics.lyrics != "") {
-    		if (lrclib_lyrics.sync){
-    			chopset_lyrics(track, lrclib_lyrics.lyrics);
+	if (!have_local) set_lyrics(track, "", "", _("Loading..."), "");
 
-	    	}
-		    else{
-		    	set_lyrics(track, "", "", lrclib_lyrics.lyrics, "");
-		    }
-	    	sync_or_unsync(lrclib_lyrics.sync);
-	    	
-	    	if (deadbeef->conf_get_int("save_method", 0) == 0){
-	    		save_meta_data(track, lrclib_lyrics);
-	    	}
-	    	else if (deadbeef->conf_get_int("save_method", 0) == 1){
-	    	    save_next_to_file(track, lrclib_lyrics);
-	    	}
-	    	
-	    	return;
-    	}
-    }
-//	If no lyrics founded in any site, show track info:
-	set_info(track);
+	lyricfinder::Candidate best;
+	auto cancelled = [track] { return !is_playing(track); };
+	lyricfinder::Result res = lyricfinder::find_best(q, best, cancelled);
+
+	if (res == lyricfinder::Result::Cancelled || !is_playing(track)) return;
+
+	if (res == lyricfinder::Result::Found && (!have_local || best.synced)) {
+		parsed_lyrics found = {best.lyrics, best.synced};
+		show_lyrics(track, found);
+
+		int method = deadbeef->conf_get_int("save_method", 0);
+		if (method == 0) save_meta_data(track, found);
+		else if (method == 1) save_next_to_file(track, found);
+		return;
+	}
+
+	if (res == lyricfinder::Result::NotFound) remember_miss(key);
+	if (!have_local) set_info(track);   // nothing found anywhere: show track info
+}
+
+// Thread entry point. Owns one reference to the track (taken by the caller).
+void update_lyrics(void *tr) {
+	DB_playItem_t *track = static_cast<DB_playItem_t*>(tr);
+	if (!track) return;
+	try {
+		update_lyrics_impl(track);
+	} catch (const std::exception &e) {
+		cerr << "lyricbar: update_lyrics failed: " << e.what() << endl;
+	} catch (...) {
+		cerr << "lyricbar: update_lyrics failed" << endl;
+	}
+	deadbeef->pl_item_unref(track);
 }
 
 //---------------------------------------------------------------------
@@ -790,30 +756,7 @@ int mkpath(const string &name, mode_t mode) {
 	return 0;
 }
 
-int remove_from_cache_action(DB_plugin_action_t *, ddb_action_context_t ctx) {
-    bindtextdomain("deadbeef-lyricbar", "gettext");
-    textdomain("deadbeef-lyricbar");
-  
-	if (ctx == DDB_ACTION_CTX_SELECTION) {
-		deadbeef->pl_lock();
-		ddb_playlist_t *playlist = deadbeef->plt_get_curr();
-		if (playlist) {
-			DB_playItem_t *current = deadbeef->plt_get_first(playlist, PL_MAIN);
-			while (current) {
-//				if (deadbeef->pl_is_selected (current)) {
-//					const char *artist = deadbeef->pl_find_meta(current, "artist");
-//					const char *title  = deadbeef->pl_find_meta(current, "title");
-//					if (is_cached(artist, title)){
-//						remove(cached_filename(artist, title).c_str());
-//					}
-//				}
-				DB_playItem_t *next = deadbeef->pl_get_next(current, PL_MAIN);
-				deadbeef->pl_unlock();
-				deadbeef->pl_item_unref(current);
-				current = next;
-			}
-			deadbeef->plt_unref(playlist);
-		}
-	}
+int remove_from_cache_action(DB_plugin_action_t *, ddb_action_context_t) {
+	// Lyrics are stored in tags / next to the file; there is no cache to purge.
 	return 0;
 }
