@@ -113,16 +113,19 @@ struct parsed_lyrics music_163_lyrics_downloader(string trackid) {
 	slist = curl_slist_append(slist, "app-platform: WebPlayer");
 	string url = "https://music.163.com/api/song/lyric?_nmclfl=1";
 	results = inside_brackets(text_downloader(slist, url, "id=" + trackid + "&tv=-1&lv=-1&rv=-1&kv=-1"), '{', '}');
+	if (results.empty()) return {"", synced};
 	all_text = results[0];
 	results = inside_brackets(results[0], '{', '}');
 	for (size_t i = 0; i < results.size(); i++) {
-	    if (all_text.substr(all_text.find(results[i]) - 7,7) == "\"lrc\":{") {
-	        string_lyrics = split(results[i], "\"lyric\":\"")[1];
+	    size_t at = all_text.find(results[i]);
+	    if (at >= 7 && all_text.substr(at - 7, 7) == "\"lrc\":{") {
+	        vector<string> lyric = split(results[i], "\"lyric\":\"");
+	        if (lyric.size() > 1) string_lyrics = lyric[1];
 	    }
 	}
 	results = split(string_lyrics,"\\n");
 	string_lyrics = replace_string(string_lyrics, "\\n", "\n");
-    string_lyrics.pop_back();
+    if (!string_lyrics.empty()) string_lyrics.pop_back();
     
     int total_lines = 1;
 	int timestamped_lines = 1;
@@ -130,7 +133,7 @@ struct parsed_lyrics music_163_lyrics_downloader(string trackid) {
     
     if(string_lyrics != ""){
 		for (size_t i = 0; i < results.size(); i++) {
-		    if (results[i].length() > 4){
+		    if (results[i].length() > 6){
 		        if ((results[i].at(0) == '[') && (results[i].at(3) == ':') && (results[i].at(6) == '.') ) {
 		            if (results[i].length() > 10){
 		                if (results[i].at(10) == ']' && results[i].at(9) != ']'){

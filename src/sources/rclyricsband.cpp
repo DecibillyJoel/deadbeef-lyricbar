@@ -70,6 +70,7 @@ struct parsed_lyrics rclyricsband_lyrics_downloader(string url){
 	slist = curl_slist_append(slist, "Accept-Charset: utf-8");
 	url = "https://rclyricsband.com/" + url;
 	results = split(text_downloader(slist, url, ""),"<p id='lrc_text' class='lrc_text_format'>");
+	if (results.size() < 2) return {"", synced};
 	results = split(results[1],"RCLyricsBand.Com</p>");
 	string_lyrics = replace_string(results[0], "<br>", "\n");
 	string_lyrics = htmlEntitiesDecode(string_lyrics);

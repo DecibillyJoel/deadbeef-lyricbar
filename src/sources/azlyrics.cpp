@@ -52,6 +52,7 @@ struct parsed_lyrics azlyrics_lyrics_downloader(string url){
 	bool synced = false;
 
 	results = split(text_downloader(slist, url, ""),"<div>");
+	if (results.size() < 2) return {"", synced};
 	results = split(results[1],"</div>");
 	results = split(results[0],"\n");
 

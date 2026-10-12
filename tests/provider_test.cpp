@@ -4,6 +4,7 @@
 #include "src/lyrics_finder.h"
 #include <cstdio>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -11,12 +12,18 @@ static std::mutex g_mx;
 using namespace std;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
+#define CHECK_MSG(c, m) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, m); ++fails; } } while (0)
 
 static vector<string> g_urls;
 static map<string,string> g_resp;      // url substring -> body
 string urlencode(const string &s) { string o; for (unsigned char c : s) { if (isalnum(c)||c=='-'||c=='_'||c=='.'||c=='~') o += c; else { char b[4]; snprintf(b,4,"%%%02x",c); o += b; } } return o; }   // lowercase hex, matching src/utils.cpp
-string text_downloader(curl_slist *, string url, string) {
+// Mirrors the real contract: text_downloader() takes ownership of the header list and
+// frees it, so handing it the same list twice is a use-after-free. Catch that here.
+static set<curl_slist *> g_freed;
+string text_downloader(curl_slist *slist, string url, string) {
 	std::lock_guard<std::mutex> lk(g_mx);
+	if (slist && !g_freed.insert(slist).second)
+		CHECK_MSG(false, "text_downloader() given an already-freed header list");
 	g_urls.push_back(url);
 	for (auto &kv : g_resp) if (url.find(kv.first) != string::npos) return kv.second;
 	return "";
