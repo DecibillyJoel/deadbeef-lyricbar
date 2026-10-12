@@ -62,9 +62,10 @@ vector<string> megalobiz_get_songs(string song,string artist){
 	for(size_t i = 0; i < artists_and_songs.size(); i+=2) {
 		if (artists_and_songs[i].find(lrc) != string::npos){
 
+			// Split "Artist - Title" (or "... by ...") into [song, artist, "", url].
 			int hyphen_freq = countFreq(hyphen,artists_and_songs[i+1]);
 			int by_freq = countFreq(by,artists_and_songs[i+1]);
-			if ((hyphen_freq = 0) || (by_freq > 0)){
+			if ((hyphen_freq == 0) || (by_freq > 0)){
 				vector<string> a_s;
 				if (hyphen_freq > 0){
 					a_s = split(artists_and_songs[i+1],hyphen);
@@ -72,6 +73,7 @@ vector<string> megalobiz_get_songs(string song,string artist){
 				if (by_freq > 0){
 					a_s = split(artists_and_songs[i+1],by);
 				}
+				if (a_s.size() < 2) continue;
 //				Artist,song,Album (empty), url to lyrics.
 				clean_songs.push_back(a_s[1]);
 				clean_songs.push_back(replace_string(a_s[0],lrc_space,""));

@@ -35,11 +35,9 @@ Automatic download if no tag or file is found. Also you can manually search for 
 ~~Same to use AZlyrics with the last part of a manual search URL.~~ (Trying to find another way).
 ![Search](https://github.com/user-attachments/assets/fefa231b-7241-4bb9-b0ce-f76ccd69e8b8)
 
-Right now, working sites are:
-- LRCLIB.
-- RCLyricsBand.
-- Megalobiz.
-- Music 163.
+Lyrics are picked automatically: every track is queried on the enabled sources in parallel and the best timestamped match wins (plain text only if nothing synced exists, and only to replace missing lyrics unless "Replace unsynced" is on). Tracks with no result anywhere are not re-queried for 30 minutes (network errors retry on next play).
+
+Automatic sources: LRCLIB, NetEase, QQ Music, Kugou, Megalobiz, lyrics.ovh (plain), RCLyricsBand (plain), Apple Music and YouTube (via lyrics.paxsenix.org), Musixmatch (opt-in: `lyricbar.enable_musixmatch`). The manual Search window offers the same providers one by one.
 
 
 There is also a window to edit lyrics.

@@ -27,11 +27,10 @@ static gboolean _pop (GtkTextView *text_view, GtkWidget *popup, gpointer user_da
 	popup_edit = gtk_menu_item_new_with_label(_("Edit"));
 
 	GList *children = gtk_container_get_children(GTK_CONTAINER(popup));
-	gtk_container_remove(GTK_CONTAINER(popup),children->data);
-	while ((children = g_list_next(children)) != NULL) {
-//		printf("%s \n",gtk_menu_item_get_label(children->data));
-		gtk_container_remove(GTK_CONTAINER(popup),children->data);
+	for (GList *l = children; l != NULL; l = l->next) {
+		gtk_container_remove(GTK_CONTAINER(popup), GTK_WIDGET(l->data));
 	}
+	g_list_free(children);
 	gtk_menu_attach(GTK_MENU(popup),popup_config,0,1,0,1);
 	gtk_menu_attach(GTK_MENU(popup),popup_search,0,1,1,2);
 	gtk_menu_attach(GTK_MENU(popup),popup_edit,0,1,2,3);
@@ -81,35 +80,24 @@ DB_plugin_action_t remove_action = {
 };
 
 static DB_plugin_action_t *lyricbar_get_actions() {
-	deadbeef->pl_lock();
+	// Lyrics live in tags / next to the audio file, so there is never anything to remove from a cache.
 	remove_action.flags |= DB_ACTION_DISABLED;
-	DB_playItem_t *current = deadbeef->pl_get_first(PL_MAIN);
-	while (current) {
-		if (deadbeef->pl_is_selected(current) && is_cached(
-		            deadbeef->pl_find_meta(current, "artist"),
-		            deadbeef->pl_find_meta(current, "title"))) {
-			remove_action.flags &= (uint32_t)~DB_ACTION_DISABLED;
-			deadbeef->pl_item_unref(current);
-			break;
-		}
-		DB_playItem_t *next = deadbeef->pl_get_next(current, PL_MAIN);
-		deadbeef->pl_item_unref(current);
-		current = next;
-	}
-	deadbeef->pl_unlock();
 	return &remove_action;
 }
 
 static ddb_gtkui_widget_t *w_lyricbar_create(void) {
-	widget_lyricbar_t *widget = malloc(sizeof(widget_lyricbar_t));
-	memset(widget, 0, sizeof(widget_lyricbar_t));
+	widget_lyricbar_t *widget = calloc(1, sizeof(widget_lyricbar_t));
+	if (!widget) return NULL;
 
 	widget->base.widget  = construct_lyricbar();
 	widget->base.destroy = lyricbar_destroy;
 	widget->base.message = message_handler;
 	GList *children = gtk_container_get_children(GTK_CONTAINER(widget->base.widget));
 	gtkui_plugin->w_override_signals(widget->base.widget, widget);
-	g_signal_connect(children->data, "populate_popup", G_CALLBACK (_pop), children->data);
+	if (children) {
+		g_signal_connect(children->data, "populate_popup", G_CALLBACK (_pop), children->data);
+		g_list_free(children);
+	}
 
 	return (ddb_gtkui_widget_t*)widget;
 }
@@ -120,6 +108,7 @@ static int lyricbar_connect() {
 		fprintf(stderr, "%s: can't find gtkui plugin\n", plugin.plugin.id);
 		return -1;
 	}
+	death_signal = 0;
 	gtkui_plugin->w_reg_widget("Lyricbar", 0, w_lyricbar_create, "lyricbar", NULL);
 	return 0;
 }
@@ -158,6 +147,8 @@ static DB_misc_t plugin = {
 	.plugin.disconnect = lyricbar_disconnect,
 	.plugin.get_actions = lyricbar_get_actions,
 	.plugin.configdialog =	"property \"Auto search enabled \" checkbox lyricbar.autosearch.enable 1; \n"
+	                        "property \"Musixmatch lyrics (unofficial API, off by default) \" checkbox lyricbar.enable_musixmatch 0; \n"
+	                        "property \"Replace unsynced lyrics with synced ones when found \" checkbox lyricbar.upgrade_unsynced 1; \n"
 	                        "property \"Font scale: \" hscale[0,10,0.01] lyricbar.fontscale 1; \n"
 							"property \"SP-DC cookie (Spotify): \" entry lyricbar.sp_dc_cookie \"\"; \n"
 };

@@ -36,9 +36,18 @@ update_po:
 	xgettext -o gettext/deadbeef-lyricbar.pot --keyword=_ --language=C++ src/*.cpp src/sources/*.cpp
 	$(foreach po,$(PO_FILES), msgmerge --update $(po) gettext/deadbeef-lyricbar.pot;)
 
-lyricbar: resource.h config_dialog.o lrclrclib.o lrcmusic163.o megalobiz.o azlyrics.o rclyricsband.o ui.o utils.o resources.o main.o lrcspotify.o
+lyricbar: resource.h paxsenix.o musixmatch.o lyrics_finder.o config_dialog.o lrclrclib.o lrcmusic163.o megalobiz.o azlyrics.o rclyricsband.o ui.o utils.o resources.o main.o lrcspotify.o
 	$(if $(LYRICBAR),, $(error You should only access this target via "gtk3" or "gtk2"))
-	$(CXX) -g -rdynamic -shared $(LDFLAGS) main.o resources.o config_dialog.o lrcspotify.o lrclrclib.o lrcmusic163.o megalobiz.o azlyrics.o rclyricsband.o ui.o utils.o $(LCURL) -o $(LYRICBAR) $(LIBS)
+	$(CXX) -g -rdynamic -shared -pthread $(LDFLAGS) main.o resources.o paxsenix.o musixmatch.o lyrics_finder.o config_dialog.o lrcspotify.o lrclrclib.o lrcmusic163.o megalobiz.o azlyrics.o rclyricsband.o ui.o utils.o $(LCURL) -o $(LYRICBAR) $(LIBS)
+
+paxsenix.o: src/sources/paxsenix.cpp src/sources/paxsenix.h src/sources/match.h src/json.h src/utils.h
+	$(CXX) src/sources/paxsenix.cpp -c $(LIBFLAGS) $(CXXFLAGS)
+
+musixmatch.o: src/sources/musixmatch.cpp src/sources/musixmatch.h src/sources/match.h src/json.h src/utils.h
+	$(CXX) src/sources/musixmatch.cpp -c $(LIBFLAGS) $(CXXFLAGS)
+
+lyrics_finder.o: src/lyrics_finder.cpp src/lyrics_finder.h src/json.h src/utils.h src/sources/paxsenix.h src/sources/musixmatch.h src/sources/megalobiz.h src/sources/rclyricsband.h
+	$(CXX) src/lyrics_finder.cpp -c $(LIBFLAGS) $(CXXFLAGS) -pthread
 
 lrcspotify.o: src/sources/lrcspotify.cpp src/sources/lrcspotify.h
 	$(CXX) src/sources/lrcspotify.cpp -c $(LIBFLAGS) $(CXXFLAGS) -lcurl
@@ -61,10 +70,10 @@ rclyricsband.o: src/sources/rclyricsband.cpp src/sources/rclyricsband.h
 ui.o: src/ui.cpp src/ui.h
 	$(CXX) src/ui.cpp -c $(LIBFLAGS) $(CXXFLAGS)
 
-utils.o: src/utils.cpp src/utils.h
+utils.o: src/utils.cpp src/utils.h src/lyrics_finder.h
 	$(CXX) src/utils.cpp -c $(LIBFLAGS) $(CXXFLAGS)
 
-config_dialog.o: src/config_dialog.cpp src/resources.h
+config_dialog.o: src/config_dialog.cpp src/resources.h src/sources/paxsenix.h src/sources/musixmatch.h
 	$(CXX) src/config_dialog.cpp  -c $(LIBFLAGS) $(CXXFLAGS)
 
 resources.o: src/resources.c
@@ -83,5 +92,8 @@ install:
 	$(foreach loc, $(LOCALES), install -d $(prefix)/share/locale/$(loc)/LC_MESSAGES;)
 	$(foreach loc, $(LOCALES), msgfmt gettext/$(loc)/deadbeef-lyricbar.po -o $(prefix)/share/locale/$(loc)/LC_MESSAGES/deadbeef-lyricbar.mo;)
 
+test:
+	bash tests/run_provider_tests.sh
+
 clean:
-	rm -f *.o *.so locales/*/*/*.mo
+	rm -f *.o *.so gettext/*/*.mo
