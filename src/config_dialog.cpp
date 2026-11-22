@@ -493,7 +493,7 @@ void on_Save_clicked (GtkButton *b, gpointer user_data) {
 	DB_playItem_t *playing_track = deadbeef->streamer_get_playing_track_safe();
 	if (playing_track) {
 		if (track && playing_track == track) {
-			death_signal = 0;
+			cancel_synced_lyrics_listener();
 			// playing_track's reference is handed to update_lyrics(), which releases it.
 			intptr_t tid = deadbeef->thread_start(update_lyrics, playing_track);
 			if (tid) deadbeef->thread_detach(tid);
@@ -854,9 +854,7 @@ void	on_Apply_offset_clicked (GtkButton *b) {
 
 gchar *actual_track_time() {
 	gchar *text;
-	deadbeef->pl_lock();
 	float pos = deadbeef->streamer_get_playpos();
-	deadbeef->pl_unlock();
 	int minutes = pos / 60;
 	pos = pos - minutes*60;
 	if (minutes < 10){

@@ -306,13 +306,13 @@ int message_handler(struct ddb_gtkui_widget_s*, uint32_t id, uintptr_t ctx, uint
 			});
 			break;
 		case DB_EV_TERMINATE:
-			death_signal = 1;
+			debug_out << "DEADBEEF CLOSED \n";
+			lyricbar_request_shutdown();
 			break;
 		case DB_EV_SONGSTARTED: {
 			auto event = reinterpret_cast<ddb_event_track_t *>(ctx);
 			if (!ui_alive || !event || !event->track || deadbeef->pl_get_item_duration(event->track) <= 0.0f)
 				return 0;
-			death_signal = 0;
 			deadbeef->pl_item_ref(event->track);   // released by update_lyrics()
 			intptr_t tid = deadbeef->thread_start(update_lyrics, event->track);
 			if (tid) deadbeef->thread_detach(tid);
@@ -327,7 +327,7 @@ extern "C"
 void lyricbar_destroy() {
 	// GTK owns and destroys the widgets; deleting the wrappers here caused double frees.
 	ui_alive = false;
-	death_signal = 1;
+	lyricbar_request_shutdown();
 	lyricView = nullptr;
 	lyricbar = nullptr;
 	tagsArtist.clear(); tagPadding.clear(); tagsSyncline.clear(); tagsNosyncline.clear(); tagsTitle.clear();

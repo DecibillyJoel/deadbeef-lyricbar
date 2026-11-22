@@ -31,8 +31,14 @@ using namespace std;
 //static const string lyrics_dir = (home_cache ? string(home_cache) : string(getenv("HOME")) + "/.cache") + "/deadbeef/lyrics/";
 
 
-
-int death_signal = 0;   // set from the GTK thread, read by listener threads (int reads/writes are atomicTarget-independent single-copy; see note below)
+std::atomic<bool> death_signal{false};
+std::atomic<unsigned> listener_generation{0};
+extern "C" void lyricbar_request_shutdown(void) {
+	death_signal.store(true);
+}
+void cancel_synced_lyrics_listener() {
+	++listener_generation;
+}
 bool lyricstart     = false;
 bool syncedlyrics   = false;
 struct timespec ts  = {0, 50000000};
@@ -126,8 +132,6 @@ struct sync_state {
 	vector<int> sizes;
 };
 
-static std::atomic<unsigned> listener_generation{0};
-
 // Scroll and highlight the current line. Skips the GTK update when nothing visible changed.
 static void write_synced(DB_playItem_t *it, const sync_state &st, int &previous_pad, string &last_key) {
 	const struct sync &l = st.lrc;
@@ -191,11 +195,7 @@ static void write_synced(DB_playItem_t *it, const sync_state &st, int &previous_
 static void thread_listener(DB_playItem_t *track, shared_ptr<sync_state> st, unsigned gen) {
 	int previous_pad = 0;
 	string last_key;
-	// NOTE: death_signal is a plain int read without a lock by listener threads. On all
-// supported targets a 4-byte aligned int load/store is single-copy atomic, and the
-// flag is only ever 0 or 1, so the worst case is one extra 50 ms loop iteration.
-// listener_generation (above) is the real synchronisation primitive.
-while (gen == listener_generation.load() && !death_signal && is_playing(track)) {
+	while (gen == listener_generation.load() && !death_signal.load() && is_playing(track)) {
 		nanosleep(&ts, NULL);
 		try {
 			write_synced(track, *st, previous_pad, last_key);
@@ -250,18 +250,23 @@ void chopset_lyrics(DB_playItem_t *track, string lyrics) {
 void save_meta_data(DB_playItem_t *playing_song, struct parsed_lyrics lyrics){
 
 	deadbeef->pl_lock();
+	// Be sure it's UTF-8.
+	char *safe_lyrics = g_utf8_make_valid(lyrics.lyrics.c_str(), -1);
+
 	if (lyrics.sync == true){
 		if (deadbeef->pl_find_meta(playing_song, "SYLT"))
 			deadbeef->pl_delete_meta(playing_song, "SYLT");
 		if (deadbeef->pl_find_meta(playing_song, "LYRICS"))
 			deadbeef->pl_delete_meta(playing_song, "LYRICS");
-		deadbeef->pl_add_meta(playing_song, "LYRICS", lyrics.lyrics.c_str());
+		deadbeef->pl_add_meta(playing_song, "LYRICS", safe_lyrics);
 	}
 	else{
 		if (deadbeef->pl_find_meta(playing_song, "UNSYNCEDLYRICS"))
 			deadbeef->pl_delete_meta(playing_song, "UNSYNCEDLYRICS");
-		deadbeef->pl_add_meta(playing_song, "UNSYNCEDLYRICS", lyrics.lyrics.c_str());	
+		deadbeef->pl_add_meta(playing_song, "UNSYNCEDLYRICS", safe_lyrics);
 	}
+
+	g_free(safe_lyrics);
 	const char *dec = deadbeef->pl_find_meta_raw(playing_song, ":DECODER"); 
 	char decoder_id[100] = {0};
 
@@ -289,6 +294,7 @@ void save_meta_data(DB_playItem_t *playing_song, struct parsed_lyrics lyrics){
 		}
 	}
 }
+
 
 // Function to encode characters to URL hexadecimal.
 std::string urlencode(const std::string &s) {
@@ -355,6 +361,11 @@ string text_downloader(curl_slist *slist, string url, string post) {
 	curl_handle = curl_easy_init();
 	string readBuffer = "";
 	if (curl_handle) {
+		curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION,
+		                 [](void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+		                     return death_signal.load() ? 1 : 0;
+		                 });
 		curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
 		curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 8L);
 		curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
@@ -566,8 +577,14 @@ void set_info(DB_playItem_t *track) {
 
 
 	info.append("Bitrate: ");
-	info.append(to_string(bitrate));
-	info.append(" kbps\n \n");
+	if (bitrate >= 0) {
+		info.append(to_string(bitrate));
+		info.append(" kbps\n \n");
+	}
+	else {
+		info.append(_("Unknown"));
+		info.append("\n \n");
+	}
 	if (playcount == 1){
 		info.append(_("There is one file in line"));
 		info.append("\n \n");
