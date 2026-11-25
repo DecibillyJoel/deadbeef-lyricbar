@@ -1,0 +1,12 @@
+{
+  "upstream": "AsVHEn/deadbeef-lyricbar",
+  "tagFormat": "v{version}",
+  "versionFields": [],
+  "lockfile": "none",
+  "install": "",
+  "test": "",
+  "build": "",
+  "pack": "",
+  "assets": [],
+  "nodeVersion": "22"
+}
